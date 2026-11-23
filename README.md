@@ -36,6 +36,16 @@ Outputs:
 
 No secrets are included in the build outputs. Credentials are supplied by the user at runtime.
 
+## Prebuilt VPS bundles
+
+Ready-to-install Linux binaries are published as GitHub release assets, so no Go toolchain is needed on the VPS:
+
+- `urnetwork-vps-linux-amd64.tar.gz`
+- `urnetwork-vps-linux-arm64.tar.gz`
+- `SHA256SUMS.txt`
+
+Each bundle contains `proxy-socks`, `provider`, `tun2socks`, `README.txt` and its own `SHA256SUMS.txt`. Verify the archive checksum before use. No credentials are included.
+
 ## Notes
 
 - The `proxy-socks` binary uses the Bionic resolver through cgo, which is why DNS works on Android devices without `/etc/resolv.conf` or `net.dns*` properties.
