@@ -1,0 +1,913 @@
+package connect
+
+import (
+	"net/netip"
+	"slices"
+	"sync"
+	"time"
+
+	"maps"
+)
+
+// events surfaced to the end user
+
+// the callback only received the `providerEvent` diffs. To get the full list of provider events, use `Events`
+type MonitorEventFunction = func(windowExpandEvent *WindowExpandEvent, providerEvents map[Id]*ProviderEvent, reset bool)
+
+type WindowExpandEvent struct {
+	// Resize alone marks a class excluded by the selected profile. Retained
+	// clients and provider events still exist, but cannot satisfy admission.
+	// The zero value keeps legacy/custom publishers active.
+	inactive bool
+	// EventTime   time.Time
+	// CurrentSize int
+	TargetSize   int
+	MinSatisfied bool
+	// Reason is the machine-readable stall diagnosis while the window is still
+	// forming: one of the WindowStall* constants (evaluating,
+	// platform-unreachable, providers-unresponsive, rate-limited,
+	// auth-failing). Derived by the window from the dominant recent evaluation
+	// failure class; empty (a legacy sender, or a bare fixture) reads as
+	// evaluating. See ip_remote_multi_client_outcome.go.
+	Reason string
+	// Failed is the terminal outcome state: the window hit its outcome
+	// deadline twice with zero providers Added. Cleared when a provider lands.
+	Failed bool
+	// Whether the window holds an added, unwarned exit that can carry v6
+	// (IPV6.md B6). Merged across windows by OR, the limited
+	// window's included. While false the apps can tell the user v6 is not
+	// carried, the in-tunnel resolver answers AAAA empty, and v6 flows are
+	// answered with no-route.
+	Ipv6Available bool
+	// Whether the window holds an added, unwarned exit labelled dualproto
+	// (server FP2-PROTOCOL.md §7.7). Merged across windows by OR. While false
+	// once the windows have formed, udp flows are answered with port
+	// unreachable. False from a publisher that predates it.
+	UdpAvailable bool
+	// Whether the Added providers are in the location that was asked for, or
+	// in its region or country because it had none (see location_match.go).
+	// A provider counts once Added, while the window may still be short of
+	// its minimum, since flows already exit through it. The monitor derives it
+	// from its provider events in the same critical section that changes
+	// them, and every delivery carries the monitor's current value. Like
+	// Ipv6Available it describes retained exits, so an inactive window does
+	// not mask it. Merged across windows from the union of their provider
+	// events. Exact from an older sender.
+	LocationMatch WindowLocationMatch
+}
+
+// provider state machine is:
+// ProviderStateInEvaluation
+//
+//	-> ProviderStateEvaluationFailed (terminal)
+//	-> ProviderStateNotAdded (terminal)
+//	-> ProviderStateAdded
+//	  -> ProviderStateRemoved (terminal)
+type ProviderState string
+
+const (
+	ProviderStateInEvaluation     ProviderState = "InEvaluation"
+	ProviderStateEvaluationFailed ProviderState = "EvaluationFailed"
+	ProviderStateNotAdded         ProviderState = "NotAdded"
+	ProviderStateAdded            ProviderState = "Added"
+	ProviderStateRemoved          ProviderState = "Removed"
+)
+
+func (self ProviderState) IsTerminal() bool {
+	switch self {
+	case ProviderStateEvaluationFailed, ProviderStateNotAdded, ProviderStateRemoved:
+		return true
+	default:
+		return false
+	}
+}
+
+func (self ProviderState) IsActive() bool {
+	switch self {
+	case ProviderStateAdded:
+		return true
+	default:
+		return false
+	}
+}
+
+type ProviderEvent struct {
+	// EventTime is when this state was entered. For `ProviderStateAdded` this
+	// is the moment the provider became routing-eligible — the connected-since
+	// time surfaced to users.
+	EventTime time.Time
+	// ClientId is the local window client id minted for this window slot.
+	ClientId Id
+	State    ProviderState
+	// EgressClientId is the provider (egress) client id — the destination
+	// tail. This is the id that identifies the provider to the user;
+	// `ClientId` does not.
+	EgressClientId Id
+	// Location is the egress provider's location. nil when unknown. Immutable
+	// — events are shallow-cloned and the pointee is shared.
+	Location *ProviderLocation
+	// The level discovery found the egress provider at: exact (empty) in the
+	// requested location, else its region or country because the requested
+	// city or region had no provider, or the internal other level for a level
+	// this build does not know (see location_match.go). Exact from an older
+	// server or sender.
+	LocationMatch LocationMatch
+	// IpFamily is the egress provider's address-family category. Legacy
+	// (empty) reads as v4-only. This is what the apps' histogram and provider
+	// rows show.
+	IpFamily IpFamily
+	// ExtenderIps are the extender addresses carrying this client's live
+	// platform transports to the exit right now (K1) -- usually none or one,
+	// briefly two across a transport migration, none over a P2P route. They
+	// are the local client's extenders and never the provider's own. Events
+	// are shallow-cloned, so the slice is copied on every write and treated
+	// as immutable by readers.
+	ExtenderIps []netip.Addr
+}
+
+func DefaultRemoteUserNatMultiClientMonitorSettings() *RemoteUserNatMultiClientMonitorSettings {
+	return &RemoteUserNatMultiClientMonitorSettings{
+		// EventWindowDuration: 120 * time.Second,
+		CallbackPendingProviderEventMaxCount: 64,
+	}
+}
+
+type RemoteUserNatMultiClientMonitorSettings struct {
+	// EventWindowDuration time.Duration
+	// CallbackPendingProviderEventMaxCount bounds the per-listener diff set
+	// while that listener is slow or blocked. Once the bound is crossed, the
+	// pending diffs are replaced by a current reset snapshot. This keeps
+	// maintenance publishers non-blocking without allowing an app suspended
+	// in the background (or a stuck server observer) to grow memory forever.
+	// Values <= 0 use the default.
+	CallbackPendingProviderEventMaxCount int
+}
+
+type MultiClientMonitor interface {
+	AddMonitorEventCallback(monitorEventCallback MonitorEventFunction) func()
+	Events() (*WindowExpandEvent, map[Id]*ProviderEvent)
+	WindowExpandEvent() *WindowExpandEvent
+	ProviderEvents() map[Id]*ProviderEvent
+}
+
+// conforms to `MultiClientMonitor`
+type RemoteUserNatMultiClientMonitor struct {
+	settings *RemoteUserNatMultiClientMonitorSettings
+
+	stateLock sync.Mutex
+
+	windowExpandEvent      WindowExpandEvent
+	clientIdProviderEvents map[Id]*ProviderEvent
+	// the newest owner generation each provider id's extender addresses were
+	// published under (SetProviderExtenderIpsForGeneration), kept while the id
+	// has an event
+	clientIdExtenderIpsGenerations map[Id]uint64
+	// the fold of clientIdProviderEvents behind windowExpandEvent.LocationMatch,
+	// kept so a merged monitor can merge it without copying the events
+	locationMatchFold locationMatchFold
+
+	monitorEventCallbacks *CallbackList[*monitorEventCallbackWorker]
+}
+
+// What a merged monitor merges a window's location match from. A monitor
+// without it, such as a test or embedder monitor, is folded from its provider
+// events.
+type monitorLocationMatchFolder interface {
+	currentLocationMatchFold() locationMatchFold
+}
+
+// The fold behind the current `WindowExpandEvent.LocationMatch`.
+func (self *RemoteUserNatMultiClientMonitor) currentLocationMatchFold() locationMatchFold {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.locationMatchFold
+}
+
+func NewRemoteUserNatMultiClientMonitorWithDefaults() *RemoteUserNatMultiClientMonitor {
+	return NewRemoteUserNatMultiClientMonitor(DefaultRemoteUserNatMultiClientMonitorSettings())
+}
+
+func NewRemoteUserNatMultiClientMonitor(settings *RemoteUserNatMultiClientMonitorSettings) *RemoteUserNatMultiClientMonitor {
+	if settings == nil {
+		settings = DefaultRemoteUserNatMultiClientMonitorSettings()
+	}
+	return &RemoteUserNatMultiClientMonitor{
+		settings: settings,
+		windowExpandEvent: WindowExpandEvent{
+			// EventTime:   time.Now(),
+			// CurrentSize: 0,
+			TargetSize:   0,
+			MinSatisfied: false,
+			Reason:       WindowStallEvaluating,
+		},
+		clientIdProviderEvents:         map[Id]*ProviderEvent{},
+		clientIdExtenderIpsGenerations: map[Id]uint64{},
+		monitorEventCallbacks:          NewCallbackList[*monitorEventCallbackWorker](),
+	}
+}
+
+func (self *RemoteUserNatMultiClientMonitor) AddMonitorEventCallback(monitorEventCallback MonitorEventFunction) func() {
+	pendingMax := self.settings.CallbackPendingProviderEventMaxCount
+	if pendingMax <= 0 {
+		pendingMax = DefaultRemoteUserNatMultiClientMonitorSettings().CallbackPendingProviderEventMaxCount
+	}
+	worker := newMonitorEventCallbackWorker(
+		monitorEventCallback,
+		self.Events,
+		self.WindowExpandEvent,
+		pendingMax,
+	)
+	callbackId := self.monitorEventCallbacks.Add(worker)
+	return func() {
+		self.monitorEventCallbacks.Remove(callbackId)
+		worker.Close()
+	}
+}
+
+// monitorCallbackEvent is one bounded, coalesced callback delivery. A listener
+// may block forever (for example, an iOS app-side reverse RPC after UIKit
+// suspends the containing app), so callbacks must never run on the window's
+// sole resize/enumeration maintenance goroutines.
+type monitorCallbackEvent struct {
+	windowExpandEvent *WindowExpandEvent
+	providerEvents    map[Id]*ProviderEvent
+	reset             bool
+}
+
+// monitorEventCallbackWorker gives each listener independent failure
+// containment: at most one callback is in flight and one coalesced event is
+// pending. A permanently blocked callback therefore costs one goroutine and a
+// fixed-size state snapshot, not the multi-client maintenance loop or an
+// unbounded goroutine/event backlog.
+//
+// Every delivery carries the monitor's expand event as it is when the callback
+// runs, a level read, not the one its dispatcher read. Dispatchers read the
+// monitor under its lock and dispatch after releasing it, and a merged
+// monitor's windows dispatch from separate workers, so an older read can reach
+// Dispatch after a newer one; delivering it would leave the listener on a
+// state the monitor has left (a location fallback whose provider is gone)
+// until an unrelated change. The provider events stay the dispatched diffs,
+// so a delivery's expand event can be ahead of them by changes whose diffs
+// arrive in the next delivery.
+type monitorEventCallbackWorker struct {
+	callback MonitorEventFunction
+	snapshot func() (*WindowExpandEvent, map[Id]*ProviderEvent)
+	// the monitor's expand event, read right before each delivery
+	current func() *WindowExpandEvent
+
+	pendingProviderEventMaxCount int
+
+	stateLock sync.Mutex
+	pending   *monitorCallbackEvent
+	closed    bool
+
+	notify chan struct{}
+	done   chan struct{}
+}
+
+func newMonitorEventCallbackWorker(
+	callback MonitorEventFunction,
+	snapshot func() (*WindowExpandEvent, map[Id]*ProviderEvent),
+	current func() *WindowExpandEvent,
+	pendingProviderEventMaxCount int,
+) *monitorEventCallbackWorker {
+	worker := &monitorEventCallbackWorker{
+		callback:                     callback,
+		snapshot:                     snapshot,
+		current:                      current,
+		pendingProviderEventMaxCount: max(1, pendingProviderEventMaxCount),
+		notify:                       make(chan struct{}, 1),
+		done:                         make(chan struct{}),
+	}
+	go HandleError(worker.run)
+	return worker
+}
+
+func cloneWindowExpandEvent(event *WindowExpandEvent) *WindowExpandEvent {
+	if event == nil {
+		return nil
+	}
+	cloned := *event
+	if cloned.inactive {
+		cloned.TargetSize = 0
+		cloned.MinSatisfied = false
+		cloned.Failed = false
+		cloned.Reason = WindowStallEvaluating
+		// Family availability describes retained exits, not new-flow admission.
+	}
+	return &cloned
+}
+
+func (self *monitorEventCallbackWorker) Dispatch(
+	windowExpandEvent *WindowExpandEvent,
+	providerEvents map[Id]*ProviderEvent,
+	reset bool,
+) {
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+
+	if self.pending == nil || reset {
+		self.pending = &monitorCallbackEvent{
+			windowExpandEvent: cloneWindowExpandEvent(windowExpandEvent),
+			providerEvents:    maps.Clone(providerEvents),
+			reset:             reset,
+		}
+	} else {
+		self.pending.windowExpandEvent = cloneWindowExpandEvent(windowExpandEvent)
+		if self.pending.providerEvents == nil {
+			self.pending.providerEvents = map[Id]*ProviderEvent{}
+		}
+		if self.pending.reset {
+			// A pending reset is a full active-state snapshot. Fold subsequent
+			// diffs into that state: terminal events delete; live states replace.
+			for clientId, providerEvent := range providerEvents {
+				if providerEvent == nil || providerEvent.State.IsTerminal() {
+					delete(self.pending.providerEvents, clientId)
+				} else {
+					self.pending.providerEvents[clientId] = providerEvent
+				}
+			}
+		} else {
+			// Ordinary diffs are last-value per client, matching monitor state.
+			maps.Copy(self.pending.providerEvents, providerEvents)
+		}
+	}
+
+	// A blocked listener can see unbounded unique terminal client ids over
+	// time. Collapse those diffs to the monitor's current active state once
+	// the cap is crossed. Dispatchers never hold monitor.stateLock while
+	// entering here, so taking a snapshot under this worker lock has no lock
+	// inversion; concurrent dispatchers simply merge after the newer snapshot.
+	if !self.pending.reset &&
+		self.pendingProviderEventMaxCount < len(self.pending.providerEvents) &&
+		self.snapshot != nil {
+		windowSnapshot, providerSnapshot := self.snapshot()
+		self.pending.windowExpandEvent = cloneWindowExpandEvent(windowSnapshot)
+		self.pending.providerEvents = maps.Clone(providerSnapshot)
+		self.pending.reset = true
+	}
+	self.stateLock.Unlock()
+
+	select {
+	case self.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (self *monitorEventCallbackWorker) run() {
+	for {
+		select {
+		case <-self.done:
+			return
+		case <-self.notify:
+		}
+
+		self.stateLock.Lock()
+		event := self.pending
+		self.pending = nil
+		closed := self.closed
+		self.stateLock.Unlock()
+		if closed {
+			return
+		}
+		if event != nil {
+			// read after taking the pending event, so the expand event is at
+			// least as new as every diff the delivery carries
+			if self.current != nil {
+				event.windowExpandEvent = self.current()
+			}
+			// A panic is listener-local. In particular, it must not escape to
+			// window.resize's HandleError handler, which cancels the whole
+			// multi-client on an unexpected panic.
+			HandleError(func() {
+				self.callback(event.windowExpandEvent, event.providerEvents, event.reset)
+			})
+		}
+	}
+}
+
+func (self *monitorEventCallbackWorker) Close() {
+	self.stateLock.Lock()
+	if self.closed {
+		self.stateLock.Unlock()
+		return
+	}
+	self.closed = true
+	self.pending = nil
+	close(self.done)
+	self.stateLock.Unlock()
+}
+
+/*
+func (self *RemoteUserNatMultiClientMonitor) event() {
+	callbacks := self.monitorEventCallbacks.Get()
+	if len(callbacks) == 0 {
+		return
+	}
+
+	var windowExpandEvent *WindowExpandEvent
+	clientIdProviderEvents := map[Id]*ProviderEvent{}
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		self.coalesceProviderEvents()
+
+		windowExpandEvent = self.windowExpandEvent
+		for _, providerEvent := range self.providerEvents {
+			clientIdProviderEvents[providerEvent.ClientId] = providerEvent
+		}
+	}()
+
+	for _, callback := range callbacks {
+		callback(windowExpandEvent, clientIdProviderEvents)
+	}
+}
+*/
+
+// must be called with `stateLock`
+// func (self *RemoteUserNatMultiClientMonitor) coalesceProviderEvents() {
+// 	windowStartTime := time.Now().Add(-self.settings.EventWindowDuration)
+
+// 	i := 0
+// 	for ; i < len(self.providerEvents) && self.providerEvents[i].EventTime.Before(windowStartTime); i += 1 {
+// 		self.providerEvents[i] = nil
+// 	}
+// 	if 0 < i {
+// 		self.providerEvents = self.providerEvents[i:]
+// 	}
+// }
+
+func (self *RemoteUserNatMultiClientMonitor) Events() (*WindowExpandEvent, map[Id]*ProviderEvent) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	return cloneWindowExpandEvent(&self.windowExpandEvent), maps.Clone(self.clientIdProviderEvents)
+}
+
+func (self *RemoteUserNatMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	return cloneWindowExpandEvent(&self.windowExpandEvent)
+
+}
+
+func (self *RemoteUserNatMultiClientMonitor) ProviderEvents() map[Id]*ProviderEvent {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	// make a copy
+	return maps.Clone(self.clientIdProviderEvents)
+}
+
+// A publisher that predates udp availability: UdpAvailable reads false.
+func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEvent(minSatisfied bool, targetSize int, ipv6Available bool) {
+	self.addWindowExpandEvent(minSatisfied, targetSize, ipv6Available, false, false)
+}
+
+// AddWindowExpandEvent with the window's udp availability (server
+// FP2-PROTOCOL.md §7.8), for a publisher outside the window's resize pass.
+func (self *RemoteUserNatMultiClientMonitor) AddWindowExpandEventWithAvailability(minSatisfied bool, targetSize int, ipv6Available bool, udpAvailable bool) {
+	self.addWindowExpandEvent(minSatisfied, targetSize, ipv6Available, udpAvailable, false)
+}
+
+// Resize publishes profile activity with the same snapshot as its size. Keep
+// the raw state for later outcome/provider updates; every public copy masks
+// inactive admission fields, including queued and coalesced callbacks.
+func (self *RemoteUserNatMultiClientMonitor) addWindowExpandEvent(minSatisfied bool, targetSize int, ipv6Available bool, udpAvailable bool, inactive bool) {
+	var windowExpandEvent WindowExpandEvent
+	changed := false
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		windowExpandEvent = WindowExpandEvent{
+			// EventTime:   time.Now(),
+			// CurrentSize: currentSize,
+			inactive:      inactive,
+			TargetSize:    targetSize,
+			MinSatisfied:  minSatisfied,
+			Ipv6Available: ipv6Available,
+			UdpAvailable:  udpAvailable,
+			// the stall diagnosis is carried, not owned, by the expand event:
+			// this call updates the size half only (SetStallStatus owns the
+			// other half)
+			Reason: self.windowExpandEvent.Reason,
+			Failed: self.windowExpandEvent.Failed,
+			// owned by the provider events
+			LocationMatch: self.windowExpandEvent.LocationMatch,
+		}
+
+		if self.windowExpandEvent != windowExpandEvent {
+			self.windowExpandEvent = windowExpandEvent
+			changed = true
+		}
+	}()
+
+	if changed {
+		if callbacks := self.monitorEventCallbacks.Get(); 0 < len(callbacks) {
+			for _, callback := range callbacks {
+				callback.Dispatch(&windowExpandEvent, nil, false)
+			}
+		}
+	}
+}
+
+// SetStallStatus records the window's stall diagnosis (see
+// ip_remote_multi_client_outcome.go) on the expand event and dispatches to
+// listeners when it changed. Returns whether anything changed, so the caller
+// can log the transition — once per change, never per pass.
+func (self *RemoteUserNatMultiClientMonitor) SetStallStatus(reason string, failed bool) bool {
+	var windowExpandEvent WindowExpandEvent
+	changed := false
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		if self.windowExpandEvent.Reason != reason || self.windowExpandEvent.Failed != failed {
+			self.windowExpandEvent.Reason = reason
+			self.windowExpandEvent.Failed = failed
+			changed = true
+		}
+		windowExpandEvent = self.windowExpandEvent
+	}()
+
+	if changed {
+		if callbacks := self.monitorEventCallbacks.Get(); 0 < len(callbacks) {
+			for _, callback := range callbacks {
+				callback.Dispatch(&windowExpandEvent, nil, false)
+			}
+		}
+	}
+	return changed
+}
+
+// provider events are serialized per `clientId`. The event carries an exact
+// location match: the form for a provider discovery did not find above the
+// requested location (see `AddProviderEventWithLocationMatch`).
+func (self *RemoteUserNatMultiClientMonitor) AddProviderEvent(clientId Id, state ProviderState, egressClientId Id, location *ProviderLocation, ipFamily IpFamily) {
+	self.AddProviderEventWithLocationMatch(clientId, state, egressClientId, location, LocationMatchExact, ipFamily, nil)
+}
+
+// AddProviderEventWithExtenderIps is the same event, carrying the extenders
+// that were on this client's transports when it was raised (K1). A later
+// change rides `SetProviderExtenderIps`; every event that replaces a live
+// one must carry the current addresses, or the replacement would blank the
+// dot's rings until the next transport change. The location match is exact,
+// as for `AddProviderEvent`.
+func (self *RemoteUserNatMultiClientMonitor) AddProviderEventWithExtenderIps(
+	clientId Id,
+	state ProviderState,
+	egressClientId Id,
+	location *ProviderLocation,
+	ipFamily IpFamily,
+	extenderIps []netip.Addr,
+) {
+	self.AddProviderEventWithLocationMatch(clientId, state, egressClientId, location, LocationMatchExact, ipFamily, extenderIps)
+}
+
+// The full provider event: it also carries the level discovery found the
+// provider at (location_match.go).
+// Like the extenders, every event that replaces a live one must carry the
+// provider's match, or the replacement would drop the provider from the
+// window's `WindowExpandEvent.LocationMatch`. The window-level match is
+// derived again in the same critical section as the event, and the event's
+// dispatch carries it, so a change of the window-level match always notifies
+// the listeners.
+func (self *RemoteUserNatMultiClientMonitor) AddProviderEventWithLocationMatch(
+	clientId Id,
+	state ProviderState,
+	egressClientId Id,
+	location *ProviderLocation,
+	locationMatch LocationMatch,
+	ipFamily IpFamily,
+	extenderIps []netip.Addr,
+) {
+	var windowExpandEvent WindowExpandEvent
+	clientIdProviderEvents := map[Id]*ProviderEvent{}
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		providerEvent := &ProviderEvent{
+			EventTime:      time.Now(),
+			ClientId:       clientId,
+			State:          state,
+			EgressClientId: egressClientId,
+			Location:       location,
+			LocationMatch:  locationMatch.Normalize(),
+			IpFamily:       ipFamily,
+			ExtenderIps:    slices.Clone(extenderIps),
+		}
+
+		// self.providerEvents = append(self.providerEvents, providerEvent)
+		// self.coalesceProviderEvents()
+		if state.IsTerminal() {
+			delete(self.clientIdProviderEvents, clientId)
+			delete(self.clientIdExtenderIpsGenerations, clientId)
+		} else {
+			self.clientIdProviderEvents[clientId] = providerEvent
+		}
+		locationMatchFold := locationMatchFold{}
+		for _, retainedProviderEvent := range self.clientIdProviderEvents {
+			locationMatchFold.add(retainedProviderEvent)
+		}
+		self.locationMatchFold = locationMatchFold
+		self.windowExpandEvent.LocationMatch = locationMatchFold.windowLocationMatch()
+
+		windowExpandEvent = self.windowExpandEvent
+		clientIdProviderEvents[providerEvent.ClientId] = providerEvent
+	}()
+
+	if callbacks := self.monitorEventCallbacks.Get(); 0 < len(callbacks) {
+		for _, callback := range callbacks {
+			callback.Dispatch(&windowExpandEvent, clientIdProviderEvents, false)
+		}
+	}
+}
+
+// SetProviderExtenderIps rewrites the extender addresses of a provider's
+// current event in place (K1) and dispatches the change. Like the family
+// rewrite above, the event's state and EventTime are untouched: the provider
+// is still Added and its connected-since time must not restart because the
+// transport moved to another extender. Returns whether anything changed;
+// unknown client ids and an unchanged set are no-ops.
+func (self *RemoteUserNatMultiClientMonitor) SetProviderExtenderIps(clientId Id, extenderIps []netip.Addr) bool {
+	return self.setProviderExtenderIps(clientId, extenderIps, nil)
+}
+
+// SetProviderExtenderIpsForGeneration is SetProviderExtenderIps from the owner
+// of a provider id's dot at `generation`: a window gives each channel it
+// installs the next generation, and the channel's watcher publishes under it
+// (multiClientWindow.watchExtenderIps). A publish under a generation older
+// than one already published for the id is refused, so a replaced channel's
+// watcher whose publish lands after its replacement's cannot put the departed
+// channel's extenders back on the live channel's dot. The generation is kept
+// even when the set is unchanged, and dropped with the id's event.
+func (self *RemoteUserNatMultiClientMonitor) SetProviderExtenderIpsForGeneration(
+	clientId Id,
+	generation uint64,
+	extenderIps []netip.Addr,
+) bool {
+	return self.setProviderExtenderIps(clientId, extenderIps, &generation)
+}
+
+// The rewrite of SetProviderExtenderIps, under the owner generation
+// `generation` when it is not nil (SetProviderExtenderIpsForGeneration).
+func (self *RemoteUserNatMultiClientMonitor) setProviderExtenderIps(
+	clientId Id,
+	extenderIps []netip.Addr,
+	generation *uint64,
+) bool {
+	var windowExpandEvent WindowExpandEvent
+	clientIdProviderEvents := map[Id]*ProviderEvent{}
+	changed := false
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		providerEvent, ok := self.clientIdProviderEvents[clientId]
+		if !ok {
+			return
+		}
+		if generation != nil {
+			if *generation < self.clientIdExtenderIpsGenerations[clientId] {
+				// a newer channel owns the dot
+				return
+			}
+			self.clientIdExtenderIpsGenerations[clientId] = *generation
+		}
+		if slices.Equal(providerEvent.ExtenderIps, extenderIps) {
+			return
+		}
+		// shallow clone: events are shared with listeners by pointer, so the
+		// slice is replaced rather than written through
+		updated := *providerEvent
+		updated.ExtenderIps = slices.Clone(extenderIps)
+		self.clientIdProviderEvents[clientId] = &updated
+		windowExpandEvent = self.windowExpandEvent
+		clientIdProviderEvents[clientId] = &updated
+		changed = true
+	}()
+
+	if changed {
+		if callbacks := self.monitorEventCallbacks.Get(); 0 < len(callbacks) {
+			for _, callback := range callbacks {
+				callback.Dispatch(&windowExpandEvent, clientIdProviderEvents, false)
+			}
+		}
+	}
+	return changed
+}
+
+type MergedMultiClientMonitor struct {
+	monitors []MultiClientMonitor
+	// Windows that contribute only their address-family and udp availability:
+	// the limited window (server FP2-PROTOCOL.md §7.8). Their size,
+	// readiness, stall reason, failure and provider events are not merged, so
+	// the apps' Connected status, grid and provider counts read the normal
+	// windows alone.
+	availabilityMonitors []MultiClientMonitor
+
+	// Test hook, set before AddMonitorEventCallback: runs in a window's
+	// callback after the merged event is read and before it is dispatched,
+	// with the window's provider events.
+	beforeDispatchForTest func(providerEvents map[Id]*ProviderEvent)
+}
+
+func NewMergedMultiClientMonitor(monitors []MultiClientMonitor) *MergedMultiClientMonitor {
+	return newMergedMultiClientMonitorWithAvailability(monitors, nil)
+}
+
+// A merged monitor whose availabilityMonitors contribute their availability
+// only (see MergedMultiClientMonitor.availabilityMonitors).
+func newMergedMultiClientMonitorWithAvailability(monitors []MultiClientMonitor, availabilityMonitors []MultiClientMonitor) *MergedMultiClientMonitor {
+	return &MergedMultiClientMonitor{
+		monitors:             monitors,
+		availabilityMonitors: availabilityMonitors,
+	}
+}
+
+func (self *MergedMultiClientMonitor) AddMonitorEventCallback(monitorEventCallback MonitorEventFunction) func() {
+	settings := DefaultRemoteUserNatMultiClientMonitorSettings()
+	worker := newMonitorEventCallbackWorker(
+		monitorEventCallback,
+		self.Events,
+		self.WindowExpandEvent,
+		settings.CallbackPendingProviderEventMaxCount,
+	)
+	c := func(_ *WindowExpandEvent, providerEvents map[Id]*ProviderEvent, reset bool) {
+		windowExpandEvent := self.WindowExpandEvent()
+		if reset {
+			// An underlying monitor's bounded worker resets to that monitor's
+			// snapshot. A merged listener reset must instead be a snapshot of
+			// ALL windows, otherwise clearing the consumer would silently drop
+			// the other window's live providers.
+			windowExpandEvent, providerEvents = self.Events()
+		}
+		if self.beforeDispatchForTest != nil {
+			self.beforeDispatchForTest(providerEvents)
+		}
+		worker.Dispatch(windowExpandEvent, providerEvents, reset)
+	}
+	// an availability window's change dispatches the merged expand event
+	// alone: its providers are never the listener's
+	availabilityChanged := func(_ *WindowExpandEvent, _ map[Id]*ProviderEvent, reset bool) {
+		windowExpandEvent := self.WindowExpandEvent()
+		var providerEvents map[Id]*ProviderEvent
+		if reset {
+			windowExpandEvent, providerEvents = self.Events()
+		}
+		worker.Dispatch(windowExpandEvent, providerEvents, reset)
+	}
+
+	subs := []func(){}
+	for _, monitor := range self.monitors {
+		sub := monitor.AddMonitorEventCallback(c)
+		subs = append(subs, sub)
+	}
+	for _, monitor := range self.availabilityMonitors {
+		sub := monitor.AddMonitorEventCallback(availabilityChanged)
+		subs = append(subs, sub)
+	}
+	return func() {
+		for _, sub := range subs {
+			sub()
+		}
+		worker.Close()
+	}
+}
+
+func (self *MergedMultiClientMonitor) Events() (*WindowExpandEvent, map[Id]*ProviderEvent) {
+	return self.WindowExpandEvent(), self.ProviderEvents()
+}
+
+// Merges the windows' expand events. It copies no provider events, so a
+// readiness sample stays cheap: the location match merges the windows' folds
+// (location_match.go), which is the fold of the union of their Added
+// providers, so one rule names the shown location whichever window holds its
+// providers.
+func (self *MergedMultiClientMonitor) WindowExpandEvent() *WindowExpandEvent {
+	netWindowExpandEvent := WindowExpandEvent{
+		TargetSize:   0,
+		MinSatisfied: false,
+	}
+	// the stall diagnosis merges by sharpness (stallReasonRank), and Failed
+	// only when EVERY window that is actually trying (failed, or a non-zero
+	// target) has failed — a disabled window (target 0 under a fixed-window
+	// profile) must not veto, and a live window must.
+	//
+	// platform-unreachable follows the Failed rule, not sharpness: it is the
+	// merged reason only when every trying window says it (with no window
+	// trying, when any window does). Every app offers its "Can't reach
+	// URnetwork" prompt on that turn (sdk CantReachOnStall), and a window
+	// that is still working proves the platform reachable: on iOS the speed
+	// window holds one exit, and that one exit's carrier dropping turned the
+	// whole connection platform-unreachable while the quality window's exits
+	// carried traffic.
+	trying := 0
+	failed := 0
+	unreachable := 0
+	anyUnreachable := false
+	for _, monitor := range self.availabilityMonitors {
+		windowExpandEvent := monitor.WindowExpandEvent()
+		netWindowExpandEvent.Ipv6Available = netWindowExpandEvent.Ipv6Available || windowExpandEvent.Ipv6Available
+		netWindowExpandEvent.UdpAvailable = netWindowExpandEvent.UdpAvailable || windowExpandEvent.UdpAvailable
+	}
+	for _, monitor := range self.monitors {
+		windowExpandEvent := monitor.WindowExpandEvent()
+		netWindowExpandEvent.TargetSize += windowExpandEvent.TargetSize
+		netWindowExpandEvent.MinSatisfied = netWindowExpandEvent.MinSatisfied || windowExpandEvent.MinSatisfied
+		netWindowExpandEvent.Ipv6Available = netWindowExpandEvent.Ipv6Available || windowExpandEvent.Ipv6Available
+		netWindowExpandEvent.UdpAvailable = netWindowExpandEvent.UdpAvailable || windowExpandEvent.UdpAvailable
+		windowTrying := windowExpandEvent.Failed || 0 < windowExpandEvent.TargetSize
+		if windowExpandEvent.Reason == WindowStallPlatformUnreachable {
+			anyUnreachable = true
+			if windowTrying {
+				unreachable += 1
+			}
+		} else if stallReasonRank(netWindowExpandEvent.Reason) < stallReasonRank(windowExpandEvent.Reason) {
+			netWindowExpandEvent.Reason = windowExpandEvent.Reason
+		}
+		if windowExpandEvent.Failed {
+			trying += 1
+			failed += 1
+		} else if windowTrying {
+			trying += 1
+		}
+	}
+	if (0 < trying && unreachable == trying) || (trying == 0 && anyUnreachable) {
+		netWindowExpandEvent.Reason = WindowStallPlatformUnreachable
+	}
+	if netWindowExpandEvent.Reason == "" {
+		netWindowExpandEvent.Reason = WindowStallEvaluating
+	}
+	netWindowExpandEvent.Failed = 0 < failed && failed == trying && !netWindowExpandEvent.MinSatisfied
+	locationMatchFold := locationMatchFold{}
+	for _, monitor := range self.monitors {
+		if folder, ok := monitor.(monitorLocationMatchFolder); ok {
+			locationMatchFold.merge(folder.currentLocationMatchFold())
+		} else {
+			for _, providerEvent := range monitor.ProviderEvents() {
+				locationMatchFold.add(providerEvent)
+			}
+		}
+	}
+	netWindowExpandEvent.LocationMatch = locationMatchFold.windowLocationMatch()
+	return &netWindowExpandEvent
+}
+
+func (self *MergedMultiClientMonitor) ProviderEvents() map[Id]*ProviderEvent {
+	netProviderEvents := map[Id]*ProviderEvent{}
+	for _, monitor := range self.monitors {
+		providerEvents := monitor.ProviderEvents()
+		maps.Copy(netProviderEvents, providerEvents)
+	}
+	return netProviderEvents
+}
+
+// Rewrites the address-family category of a provider's current event in
+// place and dispatches the change. The event's state and
+// EventTime are untouched: the provider is still Added and its connected-since
+// time must not restart because its category was corrected. Returns whether
+// anything changed; unknown client ids and unchanged categories are no-ops.
+// The multi client no longer calls it: IPV6.md B5's local downgrade, its one
+// caller, is retired (server FP2-PROTOCOL.md D11.8).
+func (self *RemoteUserNatMultiClientMonitor) SetProviderIpFamily(clientId Id, ipFamily IpFamily) bool {
+	var windowExpandEvent WindowExpandEvent
+	clientIdProviderEvents := map[Id]*ProviderEvent{}
+	changed := false
+
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+
+		providerEvent, ok := self.clientIdProviderEvents[clientId]
+		if !ok || providerEvent.IpFamily == ipFamily {
+			return
+		}
+		// shallow clone: events are shared with listeners by pointer
+		updated := *providerEvent
+		updated.IpFamily = ipFamily
+		self.clientIdProviderEvents[clientId] = &updated
+		windowExpandEvent = self.windowExpandEvent
+		clientIdProviderEvents[clientId] = &updated
+		changed = true
+	}()
+
+	if changed {
+		if callbacks := self.monitorEventCallbacks.Get(); 0 < len(callbacks) {
+			for _, callback := range callbacks {
+				callback.Dispatch(&windowExpandEvent, clientIdProviderEvents, false)
+			}
+		}
+	}
+	return changed
+}

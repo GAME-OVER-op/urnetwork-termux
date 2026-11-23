@@ -1,0 +1,6188 @@
+# Extender plan
+
+Status: design locked 2026-09-12 (section 2 onward). The original proposal
+is kept verbatim in section 1. Three review rounds refined it; where a
+bullet of the original is superseded, the decision that supersedes it says
+so. Implementation runs in the phases of section 5, in order, each with
+tests before the next starts.
+
+## 1. Original proposal
+
+- Extender speaks tcp 443, udp 443, dns and http3/dtls
+- Match upstream connection IPv4/v6
+- Pure proxy to whitelisted domains and dns unless extender header in outer connection . Only whitelisted inner tls connections are allowed to operator api/connect domains
+- Operator maintains a list of extenders with active probes for uptime. If an extender fails a probe for too many failures it is removed until it re-actives itself.
+- Operator publishes rotating geo dns with a sample of extender IPs. Use Rotue53 and extender.bringyour.com for our main operator. Match exteders to regions to publish a sample of the closest extenders per region
+- Operator and each extender is a gossip network node
+- App gets extender sample and connects to gossip network first before any other action
+- App maintains a list of extenders from the gossip network
+- The operator releases a slow drip of new extenders to the gossip the same cadence as the geo dns
+- The network space can plug in the root gossip host/ip and extender dns name
+- If an extender is tried and failed it is not retried for a timeout. It is put on a warning list. If it has only failed connections and no successful connections for a longer timeout it is removed entirely from the storage
+- Extender list are durably stored in the sdk
+- The SDK should expose the full list of known extenders, last usage, currently used extenders, and gossip network status (currently connected)
+- The gossip network should fall under the app memory policy and the mobile apps should be clients only not allow peers to reduce memory usage
+- The gossip network will notify of removed extenders. If an app notices itself removed and it wants to keep extending, it should activate again
+- Use libp2p gossip protocol
+- Each extender has a public key id that the operator signs with  root cert when the extender is activated
+- The initial connect to the operator returns the root cert public key
+- Every provider automatically tries to become an IPv4 and v6 extender using the operator acceptable api, which does a probe back and tests the extender public ips using the caller ip
+
+Clarifications given during review, which the decisions below implement:
+
+- The upstream from the extender to the operator is always TCP: tcp to
+  extender, tcp to operator; udp to extender, tcp to operator; dns to
+  extender, tcp to operator.
+- "http3/dtls" means the TLS inside QUIC on the udp carrier. There is no
+  DTLS carrier.
+- The spoof domains connect bundles are also on the whitelist, so an active
+  prober that speaks plain HTTPS to an extender gets the real site back.
+  The extender protocol lives inside the outer TLS, where it is hard to
+  discover on the wire.
+- "dns" is the DNS-encoded carrier (the whodis packet translation). Queries
+  that do not follow it are answered by a real forwarder over a trusted DoH
+  resolver, for the same reason: probers must get realistic results.
+- Low-memory apps take the feed only. Apps with more memory are full
+  members of the gossip network, which strengthens it.
+
+## 2. What already exists
+
+- `extender/extender.go` is the v1 server: it terminates TLS on the
+  configured tcp ports with a per-SNI self-signed RSA cert, reads a
+  length-prefixed `protocol.ExtenderHeader`, checks the HMAC secret list
+  and the allowed-host list, dials the destination and splices. A header
+  that does not parse closes the connection. QUIC and udp variants are
+  sketched in comments. `ExtenderSettings` has `Listen`, `DialContext` and
+  `ErrorHandler` seams used by the tests.
+- `net_extender.go` is the v1 client: `ExtenderConfig{Profile, Ip, Secret}`
+  and `newExtenderDialTlsContext`, which dials the extender ip literal, runs
+  the outer TLS with `InsecureSkipVerify` and TLS 1.3, writes the header,
+  then runs the inner TLS to the destination. It plugs into `clientDialer`
+  as a `DialTlsContextFunction`, so the platform websocket transport and
+  the api client both go through it.
+- `net_extender_profiles.go` enumerates random spoof profiles from
+  `serviceHosts` and `mailHosts`, which are empty with a FIXME that wants
+  the names kept out of the binary as plain strings. Random discovery
+  therefore produces nothing today; only manually configured extenders
+  work. `net_http.go` expands extenders from `ExtenderNetworks`,
+  `ExtenderHostnames` resolved over DoH, and these profiles, and drops them
+  after `ExtenderDropTimeout` without a success.
+- `transport_pt.go` is the DNS packet translation. The client side
+  (`PacketTranslationModeDns`) wraps a UDP socket so QUIC packets travel as
+  DNS queries and answers; the server side (`PacketTranslationModeDecode53`)
+  wraps a udp 53 listener. `handleDnsOther` receives queries that are not
+  the translation and currently ignores them. The server's `listenH3Dns`
+  in `server/connect/transport.go` runs a QUIC transport over the decode53
+  translation with tld `ur.xyz.`; the client's `h3DialCandidates` in
+  `transport_family.go` builds the matching client side.
+- quic-go v0.61 `http3` exposes both halves of a stream takeover:
+  `HTTPStreamer.HTTPStream()` on the server response writer and
+  `ClientConn.OpenRequestStream` with `RequestStream` on the client.
+- `sdk/network_space.go` carries `NetExtender` (manual ip and secret) and an
+  unused `NetExtenderAutoConfigure`. `LocalState` persists JSON dot files
+  such as `.provider_priors` through a store interface
+  (`localStatePriorsStore`), which is the shape the extender store follows.
+- `sdk/mobile_memory_policy.go` defines the low-memory profile: a mobile
+  runtime with a memory target at or below 24 MiB.
+- The server has `api-v4` and `api-v6` hosts (IPV6.md A9), so a request's
+  caller address is of a known family. `session.ResolveClientAddress`
+  yields the caller. `controller.GetLocationForIp` and `server.GetIpInfo`
+  give a country for an ip. `aws-sdk-go` v1 is already a dependency.
+  Taskworker jobs follow `taskworker/work/provider_egress_probe_work.go`.
+  Handlers use `router.WrapWithInputRequireClient` for client-jwt calls.
+  `HelloResult` returns `client_address`.
+- IPV6.md A4: family-pinned provider transports are direct-only, so an
+  extender never sits on a family-proving connection.
+
+## 3. Decisions
+
+### A. Carriers and the extender protocol
+
+A1. Three carriers, one stream contract. The extender listens on tcp 443,
+udp 443 and the dns carrier's udp 4053, and the sn miner on udp 53 as well
+(L2). Acceptance requires public tcp (443 by default) or a peer-to-peer webrtc
+connection (C2a); the udp carriers are optional (G2). Each carrier yields
+one reliable byte stream from the client:
+
+- tcp 443: TLS, terminated by the extender with a cert for the requested
+  SNI (B3).
+- udp 443: QUIC with ALPN `h3`, terminated the same way. The client's H3
+  request stream is the byte stream.
+- dns, udp 4053 (and 53 on the sn miner): the same QUIC server over the
+  decode53 packet translation on each dns socket, exactly `listenH3Dns`.
+  The client wraps its UDP socket in the dns packet translation and dials
+  QUIC to the extender ip, exactly `h3DialCandidates` for the h3dns mode,
+  on both 53 and 4053 in one staggered race (L2). The client talks to the
+  extender ip directly, so the pump variant does not apply. The encoding
+  tld is carried in the record (B2) and defaults to `ur.xyz.`.
+
+In every carrier the client sends one HTTP request carrying the extender
+header (A3). On acceptance the stream is taken over and carries the inner
+bytes: the inner TLS to the destination, or a reserved service (A8). The
+upstream from the extender is always TCP on the client's family (A7). H3 to
+the operator never crosses an extender; inside any carrier the platform
+transport runs the H1 websocket over the inner TLS, which is today's
+behavior for the tcp carrier. Ports are fixed per carrier; the old
+multi-port personas are removed.
+
+A2. Always terminated. There is no SNI splice. The outer TLS or QUIC is
+terminated for every SNI so that the request inside can be inspected.
+
+A3. The extender request. `POST /` with `Content-Type:
+application/x-ur-extender` and a body of at most 1024 bytes holding the
+serialized `ExtenderHeader`. On tcp it is an HTTP/1.1 request on the
+terminated TLS connection; the extender's `http.Server` handler writes
+`200` with the same content type and a body holding the response frame,
+then hijacks the connection. The response frame is a 4-byte big-endian
+length followed by the serialized `ExtenderResponse`, on every carrier:
+on the udp carriers the response body and the raw bytes after it are one
+http3 DATA stream, and a content length there would bound the reader the
+client keeps, so the frame delimits itself and only the tcp response
+carries a `Content-Length`. On quic and dns it is one
+H3 request opened with `OpenRequestStream`; the handler writes the same
+response and takes the stream with `HTTPStream()`. After the response both
+ends use the stream raw. The client uses `http.Request.Write` and
+`http.ReadResponse` on tcp, keeping the buffered reader for the bytes that
+follow, and the `RequestStream` type on quic and dns, so both ends share
+the http3 DATA framing. The client offers no ALPN on tcp, as today, so
+HTTP/1.1 is negotiated; the server offers `h2` and `http/1.1` so a prober
+that asks for h2 gets it. An extender request that arrives over h2 is
+refused with 403, since h2 cannot be hijacked. Because the extender has
+already read the first bytes of the stream to tell v1 from HTTP, the
+served connection is no longer the `*tls.Conn` net/http's ALPN hook needs,
+so h2 is dispatched directly through the configured `http2.Server`; the
+SNI of a tcp connection is taken from the terminated connection state and
+attached to the request context rather than read from `req.TLS`.
+
+Legacy framing: when the first four bytes after the tcp handshake decode
+as a big-endian length of at most 1024, the connection is handled as a v1
+length-prefixed header with v1 semantics and no response frame. Any other
+first bytes are prepended back and the connection goes to the HTTP server.
+No HTTP method or TLS record begins with such a length, so the check is
+unambiguous. v1 acceptance is dropped one release later. New clients send
+v2 only, so a manual extender on an old binary must upgrade.
+
+A4. Header v2. `ExtenderHeader` keeps `DestinationHost`, `DestinationPort`,
+`Timestamp`, `Nonce` and `Signature` (the HMAC over timestamp and nonce for
+private extenders with `allowedSecrets`) and gains `Challenge` (32 random
+bytes, set by probes) and `Service` (0 forward, 1 gossip, 2 feed, 3 probe). The
+response is `ExtenderResponse{PublicKey, ChallengeSignature, Carriers}`:
+the extender's ed25519 public key or empty when it has none, the signature
+over `"ur-extender-challenge-v1" || Challenge` when a challenge was given,
+and the carriers this extender serves (`tcp`, `quic`, `dns`). Refusals are
+HTTP 403 with no body: bad secret, destination not allowed, service not
+available, header too large. The connection closes after a refusal. An
+empty secret list means an open extender that accepts every header, which
+is what an operator-activated extender is; a non-empty list requires the
+HMAC to match one entry, which is the private extender of the network
+space's manual configuration.
+
+A5. Whitelist and fallback. The whitelist is the union of the bundled
+spoof list (A10) and the operator domain patterns. Operator patterns come
+from the extender's configuration; the sdk provider derives them from the
+network space hosts as `<host>` and `*.<host>` for the host and the
+migration host; connectctl takes them by flag. An extender request's
+destination must match an operator pattern; spoof domains are never valid
+destinations, and one that only a `*.` pattern admits must be a syntactic host
+name, since the client chooses everything in front of the suffix. Any other
+request on a terminated connection, HTTP/1.1, h2
+or H3, is answered by a reverse proxy to `https://<sni>` when the SNI is
+on the whitelist, using the extender's egress on the client's family with
+normal CA verification upstream, so a prober gets the real site behind a
+self-signed cert. A request whose SNI is not on the whitelist gets 403 and
+the connection closes. A name is matched only when it is a syntactic host
+name, since TLS accepts any bytes as an SNI and the name becomes the
+upstream authority. Reverse proxy bounds: request body 1 MiB, relayed
+bytes per connection 8 MiB, per-source concurrent 8, total 256, idle 30 s.
+The body and concurrency bounds answer 503 before anything upstream is
+opened; the relayed-bytes bound cuts the body, whose upstream content
+length is therefore not relayed. `ExtenderSettings.SpoofDomains` overrides
+the bundled list for tests and private deployments.
+
+A6. The dns carrier's sockets, udp 4053 and on the sn miner udp 53 (L2).
+The decode53 translation carries the dns carrier. Every query
+that is not the translation reaches a new `PacketTranslationSettings.
+DnsOtherHandler(query []byte, addr net.Addr)` hook, which the extender sets
+to a forwarder: parse the query, refuse `ANY`, resolve the question through
+the extender's own DoH cache (`DohCache.Forward` for the raw response, with
+the connect default DoH server list, overridable in `ExtenderSettings`),
+give the answer the query's message id and question name, case included
+for a 0x20 client (the cache asks in lower case), drop the upstream's OPT
+record for a query that had none (RFC 6891), and write the answer on the
+dns socket it came in on directly (`connect.DnsResponseForQuery`, as the
+mux does). An answer to another question is not sent. Per-source limit 10
+queries per second with burst 20, total 500
+per second with the same burst, one in-flight query per source address, a
+bounded worker pool of 64 so the translation's read loop never blocks,
+a 5 s forward timeout, and a response cap of 4096 bytes with the TC bit
+set when exceeded. No recursion of its own. A TXT query outside every
+encoding tld is a forwarder query, not a translation query.
+
+A7. Family match. The forward dial and the reverse proxy transport use
+`tcp4` or `tcp6` by the family of the client's outer socket, so name
+resolution yields only that family. The udp carriers use the family of the
+datagram source. A destination with no address of that family fails the
+request; the client moves to another extender. The forward dial, stream or
+datagram, is bounded by `ForwardDialTimeout`, 5 s (connect#230). The
+extender has already answered the request when it dials, so a dial that
+never connected used to hold the client's stream open, silently, for as
+long as the embedder's dialer did, which had no timeout. 5 s allows two lost
+SYNs or a slow resolver, and it is half of the operator's 10 s activation
+probe budget (C2): a forward dial that fails closes the stream while the
+probe still has budget left to see it close. The failure reaches
+`ErrorHandler` as `ExtenderErrorStageForwardDial` or
+`ExtenderErrorStageDatagramForwardDial`.
+
+A8. Reserved services. `Service` 1 (gossip) hands the taken-over stream to
+the in-process gossip listener (D2). `Service` 2 (feed) hands it to the
+feed server (D4). An extender without a gossip node refuses both with 403.
+`DestinationHost` is ignored when `Service` is set. `Service` 3 (probe) is
+answered by the response itself -- with a `ProbeNonce` for an attesting
+provider -- and the stream then carries at most one attestation frame before
+it is closed; it is the latency probe of DESIGNNOTES4.md, and no handler is
+needed to serve it. The handlers are
+settings callbacks that own the stream for the duration of the call; the
+extender closes the stream when the callback returns and keeps it in its
+shutdown set meanwhile, so a listener implementation blocks in the
+callback until its consumer releases the connection.
+
+A9. Limits. Relay read and write timeouts 30 s as today. Header read
+deadline 10 s, which also bounds the outer handshake and, as the HTTP
+server's read timeout, the request body. Forward dial 5 s (A7). Per-source concurrent connections 64, total 4096, both
+settings. Idle QUIC connections close after 30 s.
+
+A10. Spoof list and dial. `SpoofDomains()` in connect root returns the
+bundled list, loaded from an embedded xor-masked gzip resource decoded on
+first use, so the names do not appear as plain strings in the binary (the
+existing FIXME). The content is the v1 service and mail name lists recovered from the
+repository history (3523 names); tests install synthetic `.example` names
+through a seam. The generator refuses to run without an input so it can
+never rewrite the resource to an empty list by accident. A client dial picks one spoof domain per dialer at random. While the
+bundled list is empty, a dial presents no SNI at all: the operator's name
+must never appear in the outer ClientHello, and a TLS connection without
+SNI is what an extender request to an ip literal looks like anyway.
+`ExtenderProfile` becomes `{ConnectMode tcptls|quic|dns, ServerName, Port,
+Fragment, Reorder, DnsTld}` and stays comparable; fragment and reorder apply
+to tcp only. `ExtenderConfig` gains `PublicKey`. The dial per carrier: tcp
+as today; quic dials `quic.Transport` with ALPN `h3` then
+`http3.Transport.NewClientConn`; dns wraps the socket in the dns
+translation first. Then A3, then the inner TLS as today. The quic and dns
+carriers adapt the request stream to `net.Conn` (the commented
+`streamConn`, revived).
+
+Country lists. A country may bundle a list of its own as
+`res/extender_spoof_<cc>.bin`, written by `scripts/extender_spoof -country
+<cc>`, for a network that routes only the names of its own country (a
+whitelist-only mobile network). `SpoofDomainsForCountry(cc)` answers that
+list, and the global list for a country without one. A dial takes the country
+of its directory, `ExtenderDirectory.SpoofCountryCode()`: the `country_code`
+of the operator's hint while the hint is current, else the network country the
+host reports through `SetNetworkCountryCode` (on Android the mobile network's
+country while the default network is cellular), else the hint's last country
+for a week after the operator last answered it (`CountryHintMaxAge`). The
+directory stores that country with its time (E1), so a restart keeps it: no
+Apple host reports a network country, nor Windows or Linux without a modem,
+and the iOS packet tunnel extension usually ends with its tunnel, so a tunnel
+started where the hint cannot be read would otherwise have no country. Every
+answer replaces and renews it; past the week it is never used.
+The hint is read through direct dialers only (DESIGNNOTES4.md §4): where only
+an extender reaches the operator, the hint fails rather than placing it.
+A failed hint and a path change make the hint's country stale, and a path
+change asks for the hint again at once; a failed hint is asked again after a
+backoff (1 min doubling to 6 h on the same path), and no read holds up the
+refresh pass. When the list in force changes, the strategy
+drops its discovery extender dialers so every address is drawn again from the
+new list. The whitelist of A5 is every bundled list, `AllSpoofDomains()`. No
+country list is bundled yet; each needs a measurement of what its network lets
+through.
+
+A11. NLayer extenders. An NLayer extender relays a forward to one of a
+preset list of other extenders, its hops, instead of to the destination;
+the extenders a request crosses are its layers. The list is
+`ExtenderSettings.NLayerHops`, which connectctl takes as a repeatable
+`--nlayer-hop=<spec>`, `[tcp|quic|dns://]<ip>[:<port>]` with optional
+`key`, `secret_file`, `sni`, `tld`, `fragment` and `reorder` parameters
+(G4); an empty list is an ordinary extender. A private hop's secret is the
+trimmed content of the file `secret_file` names, read once at start and
+kept in memory only: a process's arguments are readable by every user of
+the host, so a spec that carries a secret in its address is refused, and
+no error repeats the spec or the file's content. For each accepted forward the NLayer
+extender is an extender client of one hop: a fresh outer TLS on the hop's
+own carrier, with the outer name of the hop's configuration and the hop's
+identity leaf pinned when the configuration names its key (B3), then a new
+`ExtenderHeader` with the same `DestinationHost`, `DestinationPort` and
+`Datagram`, service forward, the hop's secret when the hop is private (A4),
+and `HopCount` one more than the header it received. Once the hop's
+response frame is read, the inner bytes are relayed both ways by the plain
+stream relay of A9. The client's inner TLS to the destination stays end to
+end and opaque at every layer, and nothing is reframed: the framing of a
+datagram request passes through untouched, and only the last layer, an
+ordinary extender, turns the frames into udp. A tcp hop dial leaves through
+the forward egress of A7.
+
+What is not relayed. The gossip and feed services of A8 are served by the
+NLayer extender itself, so their requests never leave it; a probe is
+relayed, below. The response to every request, a forward's and a probe's
+included, is the extender's own, so the identity a chain shows its client
+is the first layer's key, and a record or a pin covers the first layer
+only. Every layer applies its own whitelist (A5), the first before any hop
+is dialed. The response to a forward is written before the hop dial, as it
+is before a forward dial, so a hop that cannot be reached closes the stream
+after the 200, which the client sees as a forward that failed.
+
+Probes (GEOMAP §2.9, D22). An NLayer extender never answers a probe
+itself: it relays it to the end of its chain, so the round trip a pinger
+measures is the path a client of the front would use, and the extender
+that judges and co-signs the claim is the one that terminates the chain.
+The front admits the probe as any extender does -- the per-source probe
+limiter (GEOMAP §2.1), one pinger at most -- dials a hop with the same pinger
+identity, service probe and `HopCount` one more, through the hop rules
+above, and waits for the hop's response before it answers. A hop dial that
+fails is a 403, so the pinger, which has had no response, probes again.
+The answer carries the front's own key, its signature over the client's
+challenge and its carriers, and three fields of the end's:
+`ExtenderResponse.ProbeNonce`, `HopCount` (field 5), which the end sets to
+the `HopCount` it received, 0 for a direct probe, and `ChainEndPublicKey`
+(field 6), the hop's `ChainEndPublicKey` when it relayed further, else the
+hop's own key, and empty on a direct probe. From there the bytes are
+relayed both ways, the attestation to the end and the verdict back, until
+the streams close. The pinger measures header to response as before, which
+through a chain is the whole chain, binds its claim to the chain end's key
+and verifies the co-signature under it, and records the sample against the
+address it dialed, the front's; its ping report carries `hop_count`. The
+depth is copied back unsigned, so a response that names a chain end other
+than the extender dialed counts as at least one hop whatever it says, and a
+relay cannot pass for a direct ping. There is no inner TLS in a probe for
+the loop check to read. A front instead holds one relayed probe per signed
+source at a time -- `ProbeClientId` for a provider, `ProbeExtenderPublicKey`
+for an extender -- and refuses another from that source with 403 while one
+is in flight: a probe that comes back around carries the same source. The
+identity in the header is unsigned when the front reads it, but it is the
+one the attestation must be signed by at the end, so a spoofed header buys a
+refused claim. Its limit is stated plainly: anyone can occupy a source's one
+slot through a front for the life of one probe, which the end's attestation
+timeout bounds. A ranking probe names no source and gets no entry; the
+depth bound is its loop guard. The end judges every relayed probe from the
+front's address, so the end's per-source probe rate applies to all of a
+front's pingers together.
+
+Hop selection. A connection picks a hop at random among those not held and
+not yet tried by it, preferring hops of its own family, so a chain egresses
+on the family its client reached the first layer on (A7), and falls back to
+the other family only when none of its own is left. A hop whose dial fails
+-- unreachable, a handshake or pin that fails, or past `NLayerDialTimeout`,
+10 s -- is held for `NLayerHoldTimeout`, 30 s, and the connection tries
+another hop, up to `NLayerAttempts`, 2; every connection skips a held hop
+until its hold runs out. A hop that answers with a refusal is not held,
+since a refusal can be about the request, its destination or its depth,
+rather than about the hop. `NLayerStats()` reports per hop the connections
+relayed, the refusals, the failed dials and the hold; each hold, and its
+release when the hold is next consulted after it ran out, reaches
+`NLayerHoldHandler`, which connectctl logs.
+
+Depth bound. `HopCount`, field 11 of the header, is how many extenders a
+request has already crossed: 0 from a client, one more at each layer. Every
+extender, NLayer or not, refuses a forward whose `HopCount` + 1 is past
+`NLayerMaxDepth`, 4, with 403 and before its whitelist (v1: with the
+close), so a chain holds at most that many extenders. Without it a chain
+whose hops lead back into it relays one request forever, each traversal a
+new connection holding a slot on every layer it crosses until the limits of
+A9 refuse it.
+
+Loop check. An NLayer extender also refuses a stream that has come back to
+it. After the response and before the hop dial it reads the first inner
+record, only through the ClientHello's random and within
+`NLayerClientHelloTimeout`, 2 s, and closes the stream when another of its
+connections is relaying the same random. A random is held for the life of
+its relay, so the set is bounded by the connections in flight, and a loop
+A -> B -> A ends at A's second entry after two hop dials rather than at the
+depth bound. A HelloRetryRequest repeats the random on its own connection,
+which is never read twice. A datagram request is not read ahead at all,
+since its stream carries frames rather than an inner TLS, and a stream that
+does not start with a ClientHello -- a plain inner stream, a client that
+sends nothing within the timeout -- is relayed unchanged, with what was
+read in front. Both are left to the depth bound, which is the backstop for
+every request. An extender with no hops never forwards to another extender,
+so it cannot be inside a loop, and it does not read ahead.
+
+Limits. A hop counts every connection a layer relays to it against one
+source address, so a hop behind a busy layer needs a per-source bound above
+the 64 of A9. A hop dial is also a carrier claim on a host with a memory
+budget; a claim the budget refuses is this host's condition, so the
+connection is refused and the hop is neither held nor counted, as a client
+dialer leaves an extender alone for the same refusal (E1). An extender that predates `HopCount` ignores it; it cannot be
+an NLayer extender, so it only ever ends a chain, one layer past the bound
+the layers before it enforce. An NLayer extender activates as any other
+does (C2): the forward probe arrives from its last layer, on the family the
+family preference kept.
+
+A12. Admission limits. An extender admits every connection, on every
+carrier, by the source's subnet hash — the same /29 (v4) and /56 (v6) prefix
+the platform's address hash keys on, hashed with a pepper drawn at process
+start, so the extender's tables hold no address — under two limits that are
+extender configuration values per instance (`ExtenderSettings`, connectctl
+`--admission_subnets_per_minute` and `--admission_actions_per_subnet_per_minute`,
+the same fields on the sdk's native role): `AdmissionSubnetsPerMinute`
+(default 1000), the distinct subnet hashes admitted in any one minute, which
+bounds the whole extender; and `AdmissionActionsPerSubnetPerMinute`
+(default 8), the actions from one subnet hash in any one minute, which stops
+one client flooding it. An action is anything the extender does work for: a
+forward, a gossip or feed stream, a probe (a ping is an action like any
+other). Both are sliding windows, token buckets refilled at the limit per
+minute with a burst of the limit, so a quiet minute does not bank credit.
+A connection whose header is signed with an allowed secret — a client's or
+a private hop's (A11) — is exempt from the per-subnet limit, because the
+secret is the trust and an NLayer hop otherwise sees its whole front as one
+subnet; it still counts toward the per-instance limit. Over either limit the
+extender answers **429**, no body, with a `Retry-After` drawn at random
+between `AdmissionRetryAfterMin` (15 s) and `AdmissionRetryAfterMax`
+(60 s), then closes the connection. A 429 is the ordinary answer any
+rate-limited site gives, so it adds no fingerprint; everything else stays
+403 (A4). Answering costs a TLS handshake, so a subnet that keeps coming
+past `AdmissionRefusalsPerSubnetPerMinute` (default 8) further refusals in
+the same minute is closed at accept without one. The concurrent-connection
+caps (`MaxConnectionCountPerSource`, `MaxConnectionCount`) and the probe
+service's own per-source bucket stay beneath these. Two consequences of the
+defaults, stated plainly: a large NAT — a carrier's CGNAT pool, a campus —
+puts many users behind one /29, and eight actions a minute among them is
+tight, so `LimitedBySourceCount` is the number to watch after the first
+deploy and the per-subnet limit or the v4 prefix width are the knobs; and
+an NLayer hop counts its whole front as one subnet, so a hop lists its
+fronts in `AdmissionUnlimitedSources` — a per-instance list of source
+prefixes (connectctl `--admission_unlimited_source=<cidr>`, repeatable; the
+same field on the sdk's native role) that are exempt from both limits,
+matched on the source address at accept before it is hashed and never
+retained. An unlimited source is trusted to rate-limit its own clients, and
+the trust is recursive: a front rate-limits under its own A12 settings and
+may in turn list sources it trusts, each layer answering for the one
+before it. The operator's own probes need no exemption at today's cadence —
+the liveness probe dials each address once every five minutes and
+activation dials each carrier once — and if that cadence ever grows, the
+activation response is the place to hand an extender the operator's prober
+prefixes as unlimited sources, since the extender already trusts what that
+response signs. The status counts
+refusals by limit (`LimitedBySubnetsCount`, `LimitedBySourceCount`) and the
+provide status carries them.
+
+On the client (E), a 429 is `connect.ExtenderLimitedError` with the
+`Retry-After` it carried, and it is not a failure: no failure count, no hold.
+The directory marks the address limited until now plus a backoff — the
+`Retry-After` jittered uniformly by ±50 %, or `ExtenderLimitedBackoff`
+(30 s) jittered the same way when none came — and orders limited candidates
+after every healthy one, whatever their latency or continent, until the
+backoff passes; the probe pass and the feed dial skip a limited candidate,
+and when every candidate is limited the dialer waits for the earliest
+backoff to pass rather than retrying at once. An NLayer front treats a
+hop's 429 the same way: the hop is limited, not held, other hops are
+preferred, and when every hop is limited the front answers its own client
+429 with the shortest remaining backoff, so a limit propagates back to the
+client as a limit and not as a refusal. A pinger limited by a target
+records no verdict for that probe (it is a retry, not a refusal, and never
+evidence in connect/GEOMAP.md §5.5).
+
+### B. Identity, records and trust
+
+B1. Keys. Ed25519 everywhere. An extender generates its identity key once;
+the sdk persists it in local state as `.extender_key` (JSON with the hex
+seed), connectctl reads it from `--extender_key_file` and creates it when
+absent. The key stays on the host when the account changes (E7), and the
+operator registers it to the network that first activated it (C2c), so a host
+that moves to another network needs a new key. The operator root key lives in
+the vault resource `extender.yml` as `root_private_key_hex` with
+`root_public_keys_hex` listing every key whose signatures are accepted, for
+rotation.
+
+B2. Records. In `protocol/extender.proto`:
+
+- `ExtenderAddress{Ip, IpVersion, Carriers []string}`, with `Ip` the text
+  form of the address.
+- `ExtenderRecordBody{PublicKey, Addresses, TcpPort, UdpPort, DnsPort,
+  DnsTld, CountryCode, IssueTimeMs, ExpireTimeMs, NetworkHost}`.
+- `ExtenderRecord{Body bytes, RootSignature, RootKeyId}` where `Body` is
+  the serialized body, the signature is ed25519 over
+  `"ur-extender-record-v1" || Body`, and `RootKeyId` is the first 8 bytes
+  of sha256 of the signing public key.
+- `ExtenderRevocationBody{PublicKey, IssueTimeMs, NetworkHost}` and
+  `ExtenderRevocation{Body, RootSignature, RootKeyId}` with domain
+  `"ur-extender-revocation-v1"`.
+- `ExtenderGossipMessage{oneof record | revocation}`.
+- `ExtenderFeedRequest{SampleCount, Subscribe}` and
+  `ExtenderFeedFrame{oneof record | revocation | end_of_sample bool |
+  keepalive bool}`.
+
+Signing over the opaque serialized body avoids protobuf serialization
+ambiguity. Verification and construction live in connect root
+(`extender_record.go`) so the client, the mesh validators and the server
+share one implementation. `NetworkHost` separates network spaces: a client
+ignores records for a host that is neither its host nor its migration
+host.
+
+B3. Extender certificates. The identity key signs a self-signed ed25519 CA
+cert (IsCA, ten years), regenerated when the key changes. One ECDSA P-256
+leaf key is generated per process; a leaf per SNI is issued under the CA
+on first sight, valid 30 days ahead and back-dated by the clock-skew
+window like every certificate here, and cached (1024 entries, least
+recently used evicted). This
+replaces the per-connection RSA-2048 `selfSign`. QUIC uses the same
+callback. A client that knows the extender's key from a record sets
+`VerifyPeerCertificate` to require that the leaf's signature verifies
+under that key, keeping `InsecureSkipVerify` so no roots are consulted. A
+client never dials an address it has no key for unless that address was
+configured by hand (E1), so the only unverified outer handshake is a
+manual extender's, whose trust anchor is the person who configured it.
+Every address that arrived from dns is dialed only once a root-signed
+record names it, which the TXT bootstrap of C5 delivers in the same
+answer as the address. An extender without an identity key issues
+per-SNI self-signed leaves.
+
+B4. Root key distribution. The network space values carry
+`ExtenderRootPublicKeys` (hex) as the trust anchor before first contact,
+and `HelloResult` gains `extender_root_public_keys`. The hello list
+replaces the stored list, since it arrives over the platform's pinned TLS
+even through an untrusted extender. A record or revocation signed by a key
+not in the current list is rejected, also one verified under keys that were
+replaced before it was stored.
+
+B5. Directory semantics per key. Keep the newest record and the newest
+revocation by issue time. A key is active when it has a record, the
+record has not expired (5 minutes skew allowed) and no revocation with an
+issue time at or after the record's issue time exists. A re-activation
+therefore issues a record newer than any revocation.
+
+### C. Operator: activation, probes, storage, publishing
+
+C1. Tables.
+
+```
+network_extender (
+    extender_id uuid PRIMARY KEY,
+    network_id uuid NOT NULL,
+    client_id uuid NOT NULL,
+    public_key bytea NOT NULL UNIQUE,
+    create_time timestamp NOT NULL,
+    tcp_port int NOT NULL DEFAULT 443,
+    udp_port int NOT NULL DEFAULT 443,
+    dns_port int NOT NULL DEFAULT 53,
+    dns_tld varchar NOT NULL DEFAULT 'ur.xyz.',
+    country_code varchar NOT NULL DEFAULT '',
+    active bool NOT NULL DEFAULT false,
+    revoke_time timestamp NULL,
+    record_issue_time timestamp NULL
+)
+network_extender_address (
+    extender_id uuid NOT NULL,
+    ip_version smallint NOT NULL,
+    ip inet NOT NULL,
+    carriers varchar NOT NULL,
+    activate_time timestamp NOT NULL,
+    last_probe_time timestamp NULL,
+    last_probe_success_time timestamp NULL,
+    consecutive_probe_failures int NOT NULL DEFAULT 0,
+    active bool NOT NULL DEFAULT true,
+    last_publish_time timestamp NULL,
+    PRIMARY KEY (extender_id, ip_version)
+)
+network_extender_publish (
+    publish_id uuid PRIMARY KEY,
+    extender_id uuid NOT NULL,
+    kind smallint NOT NULL,
+    message bytea NOT NULL,
+    create_time timestamp NOT NULL,
+    published_time timestamp NULL
+)
+```
+
+`carriers` is a comma-separated list. `kind` is 1 record, 2 revocation.
+`message` is a serialized `ExtenderGossipMessage`. Indexes on
+`network_extender_address (active, last_publish_time)` and
+`network_extender_publish (published_time, create_time)`.
+
+`public_key` is unique, so a key has one row. `network_id` is the network
+whose activation first stored the key, and no activation changes it;
+`client_id` is the client of that network that activated it last (C2c). The
+contract parties of J2 name these two. Nothing deletes a row, so a key stays
+registered through a revocation, a removed client and a removed network.
+
+C2. Activation. `POST /network/extender-activate`, client jwt, on `api-v4`
+or `api-v6` so the caller address has one family. An operator without
+family hosts, such as a development operator on an ip literal, is
+activated through its plain api url instead, and the family of the
+outcome is the one the result reports. Args
+`{public_key_hex, tcp_port, udp_port, dns_port, dns_tld, carriers}`, and the
+optional `run_id`, `run_start_time` and `previous_exit` of G3, stored when they
+are well formed, and a well-typed one never refuses an activation. Rate
+limits, each per address family over a trailing hour, so one family's
+failures never spend the other's (2026-10-28), and per host (connect#230,
+2026-11-01): 6 per client; 6 per caller address, its /32 or /64, over every
+client and every account, kept under a keyed hash; and per account 60 plus 6
+for each proven host, at most 1200. A proven host is an identity key of the
+account that passed activation on that family between 1 hour and 7 days ago,
+counted once per address and at most 32 per /24 or /48, so a fleet that has
+passed activation restarts at once and a new one ramps an hour at a time;
+each api process reuses an account's proven host candidates for a minute
+and counts them at every read's own time. A key its network already proved
+at the caller's /32 or /64, its last pass there at most 7 days ago, spends
+a budget of its own at that address, 6 an hour, instead of the address's:
+a public extender relays posts to the api from its own address, so other
+accounts' posts through it spend the address's budget, and must not hold
+off its own re-activation. The api process probes at most 64 activations
+at once. A post over a budget, over the probes, or whose wait for a
+budget's lock ran past its 2 s bound is refused with the wait until there
+is room in `retry_after_seconds`, which the activator waits out (G3), and
+spends nothing: for the budgets, the longest wait of those with no room
+and up to a minute more, drawn so a fleet refused together does not come
+back together; for a busy api, one to three minutes. The attempts one
+spend records for its budgets are each recorded up to a second before it,
+so no create_time joins the address's hashed row to its client's and
+account's. An
+activation posted to `api-v4` or `api-v6` that arrives on the other family
+is refused before it is probed, and so is a key another network holds (C2c).
+The handler probes the caller ip synchronously
+within one 10 s probe budget, in this order: the required test (C2a) --
+`connect.ProbeExtenderCarrier` dials the tcp carrier with a random spoof
+name, sends a header with a challenge and verifies the response signature
+against `public_key_hex`, then `connect.ProbeExtenderForward` performs a
+verified `GET /hello` through the tcp carrier to the api url -- and only
+then every offered optional carrier at once, each dns port (L2) and quic,
+each until it answers or the probe budget ends (connect#230): none waits on
+another, so a port with nothing bound costs only itself and a slow carrier
+has all of what is left of the budget. An activation that offers webrtc
+runs the webrtc test, one dial over the carrier through the signaling relay
+of S8, beside the tcp test and at once, and its optional carriers start once
+either passes (S8). Result `{activated, ip, ip_version,
+carriers, refused_carriers, probe_steps, error, retry_after_seconds,
+expire_time, allowed_hosts, record, bootstrap}`: `record` is the extender's own freshly signed record,
+`bootstrap` up to 8 signed records of other active extenders, chosen at
+random, `allowed_hosts` the operator patterns of A5. On success the row,
+which the upsert updates only for the network that holds the key (C2c), and
+the family's address row are upserted active, `record_issue_time` is
+set, and a record publish row is inserted. The country comes from the ip
+geolocation of the caller. A failed required test (C2a) returns `activated: false`
+with the failing test in `error` and stores nothing. An optional carrier
+that fails its probe is left out of the stored `carriers` and listed in
+`refused_carriers` (carrier, port, error, elapsed_ms, budget_left_ms); it does not fail the activation. Acceptance requires
+public tcp (the offered `tcp_port`, 443 by default) or peer-to-peer webrtc, each of which proves the forward
+(C2a). Zero ports and an empty tld
+take the C1 defaults. The budgets are spent at the probe: every check that
+refuses without dialing the caller (the arguments, the caller and its
+family, the configuration, the key's network) precedes them, so a malformed
+request, an unconfigured operator or a key another network holds never spends
+a caller's budget, and the client's, the address's and the account's budgets
+are spent together or not at all, one spend of a budget at a time. A budget
+that is already spent refuses first, on a read that takes no lock
+(connect#230): a fleet's posts that one budget refuses would otherwise each
+queue on its lock, holding a database connection, to be told what the read
+says. That read only ever refuses, and what it finds room for is decided again
+under the lock. Every activation
+that dials the caller is counted, whatever its probe finds. A failed
+geolocation leaves the country empty rather than failing the activation.
+The bootstrap records are signed fresh at each activation. Probe requests
+name the api host on port 443 as their destination.
+
+C2a. Acceptance criteria (owner, 2026-10-07). An extender is accepted when
+it passes at least one required test. Every other carrier is optional.
+
+- Required, at least one of:
+  - Public tcp, on the offered `tcp_port` (443 by default). The activation probe dials the caller's public address
+    on the tcp carrier, verifies the challenge signature against
+    `public_key_hex`, and proves the forward with a verified `GET /hello`
+    through it (C2).
+  - Peer-to-peer webrtc. The operator opens a webrtc data channel to the
+    extender through the exchange signaling (ICE and STUN traversal, the
+    webrtc carrier), verifies the same challenge signature over it, and
+    proves the forward with the same verified `GET /hello` through the data
+    channel. This is the path for an extender behind NAT, which has no
+    public inbound address. It lands with the webrtc carrier.
+- Optional, probed only when offered, never gating: udp 443 (quic), the dns
+  carrier on udp 4053, and udp 53 on the sn miner. An optional carrier that
+  fails its probe is left out of the stored `carriers`; it does not fail an
+  activation that passed a required test.
+- Not accepted: an extender that passes neither required test. Activation
+  returns `activated: false` with the failed required tests in `error` and
+  stores nothing.
+- Uptime follows acceptance. C3 probes each address over the required path
+  it was accepted on: the tcp challenge for a public-tcp extender, a webrtc
+  challenge for a webrtc extender. A webrtc extender is never deactivated
+  for lacking a public tcp port.
+- The stored address and the signed record carry which required path the
+  extender passed, so clients and the uptime task use the right one.
+- Provider role (G2). The role's `tcp_unavailable` error applies only when
+  the webrtc path is also unavailable; a provider that cannot bind tcp 443
+  but can complete the webrtc test still extends.
+- Tests (deterministic, per CODESTYLE.md): accepted on tcp alone; accepted
+  on webrtc alone; accepted when both pass; not accepted when neither
+  passes; a failing optional carrier is left out of `carriers` without
+  failing an activation that passed a required test; the uptime task probes
+  a webrtc-accepted address over webrtc and does not deactivate it for a
+  missing tcp port.
+
+C2b. Probe timing (connect#230, 2026-11-01). Every probe step is timed,
+because the steps share one budget and an answer that came too late, one
+starved by the steps before it, and no answer at all were the same
+`context deadline exceeded`. `probe_steps` lists every step run, in order,
+refusals included: `name` (`tcp`, `forward`, `dns`, `quic`), `ip_version`,
+`port` (the forward names the tcp port it runs over), `elapsed_ms`,
+`budget_left_ms` (what was left of the 10 s budget when the step started)
+and `outcome` (`ok`; `error`, it failed on its own; `timeout`, its budget
+ran out before it answered). A refusal's last step is the one that refused
+it, unless the refusal came at the store, after the probe had passed (C2c); a
+request refused before the probe has no list. Each
+`refused_carriers` entry carries the same two times. A refusal says how
+long its step ran: "the forward failed after 0.1 s: ..." makes no claim
+about the budget, while a step whose budget ran out says how much it had,
+"the forward did not answer within the 0.5 s left of the 10 s probe
+budget: context deadline exceeded" or "the tcp carrier did not answer
+within the 10 s probe budget: ...". A left out carrier that timed out reads
+"no answer within the 8.5 s left of the 10 s probe budget: ...", the same
+for each, since the optional carriers start together once the required
+test has passed; one that failed on its own keeps its probe's error. Old providers decode the answer into
+`connect.ExtenderActivateResult`, which skips the new fields. The api
+counts every activation in `urnetwork_extender_activations_total{stage,
+outcome, family}` -- stage `request`, `config`, `owner` (the key is registered
+to another network, C2c), `busy`, `budget`, `tcp`,
+`forward` or `store`; outcome `refused`, `error`, `timeout`,
+`other_family` or `activated`, and for `busy` why (`probes`,
+`budget_lock`) and for `budget` which budget refused (`client`,
+`address`, `proven_address`, `account`; connect#230); family `ipv4`,
+`ipv6` or `unknown` -- and times every step in
+`urnetwork_extender_activation_step_seconds{step, outcome}`, a histogram
+whose buckets end at 10 s. The extenders dashboard shows both.
+
+C2c. Key ownership (2026-11-02). An identity key belongs to the network
+whose activation first stored it, which holds the key from then on (C1). Who
+may activate a key, on either family:
+
+- A key no network holds: the activation is judged as C2 says, and once it
+  is stored the client's network holds the key.
+- A key the client's network holds: any client of that network. The row takes
+  that client, so a device that returns to its account under a new client
+  keeps its extender, with its id and its history.
+- A key another network holds: no client. The activation is refused.
+
+The refusal is the ordinary answer of C2, a 200 with `activated: false` and
+`refusal: "key_other_network"`, and its `error` is fixed: "This extender key is
+registered to another network, so it cannot be activated for this one. An
+updated app makes a new extender key for this network on its own; otherwise
+remove the extender key file and restart to make a new one." Its first sentence
+is what an extender reads the refusal by from an operator that predates
+`refusal` (2026-11-02 to 11-03, whose second sentence read "Generate a new
+extender key, or ask support to move the key to this network."), so it stays as
+it is. It names no network, and it has no
+`retry_after_seconds`, since waiting does not change the answer. The handler
+reads the key's network once the configuration has passed and before the probe
+guard, so the refusal dials nothing, spends no budget and has no
+`probe_steps`. The store decides again in the transaction that writes, whose
+upsert updates only a row of the activating network: a post that finds the key
+another network's only at that point writes nothing and gets the same refusal,
+with the `probe_steps` of its probe, whose budgets stay spent. A post's
+measurement opt-out (lag.dev/PLAN.md C9) applies only for the network that holds
+the key. A refused post leaves the row, its addresses, its record, its
+activation history and the publish queue as they were, and the uptime task goes
+on probing those addresses (C3). The refusal is counted under stage `owner`
+(C2b).
+
+An extender reads it by `refusal`, or by the first sentence of `error` from an
+operator that predates `refusal` (`connect.ExtenderActivateResult.
+KeyHeldByAnotherNetwork`). The family is held until its tick rather than on the
+backoff, since no wait changes the answer, and a trigger still posts it at once
+(G3). The status reads `error`, case `activation_refused`, with the refusal as
+its reason, unless the directory shows the key revoked, which N3 tests first.
+Only the extender role is refused. The device's VPN and its providing go on.
+
+The key stays on the host when the account changes (B1, E7). So a device
+signed in to another account, one signed in to a new account after the old one
+was deleted, and a state directory copied to a host under another account each
+post a key another network holds.
+
+Nothing frees a key: a revocation (C3), a sign-out, "Reset extenders" (E7), a
+removed client and a removed network all leave it registered, and no route
+changes a key's network.
+
+A key is reissued on the host, by replacing it. The new key is a new extender
+with no history, under the same rule. The old key's row stays with its network,
+and the uptime probes deactivate its addresses once the host answers for the
+new key (C3).
+
+- The provider role of the sdk (G2) makes the new key itself, for a space with
+  local state, which is every app's (decided 2026-11-03). On the refusal the
+  role asks the provider for a key of the network's own, at most once a role.
+  The space makes a key, keeps it in `.extender_network_keys` under the id of
+  the network the client jwt names, and the provider starts the role again on
+  it, as a new process starts, with every family due. While the role runs for
+  that network the space presents that key, to the node as well (B1), and the
+  measurement name is the new extender id's (C4), so it is the network's
+  identity from then on. `.extender_key` is left as it was, and a network with
+  no key of its own runs under it, so a device that goes back to the account
+  that holds `.extender_key` presents it again, with its history. Both files
+  are kept across a sign-out (E7). A space makes a network at most one key a
+  day, so no run of the operator's answers can make it churn through keys; a
+  refusal of the network's key within the day stands in the status. A refusal
+  of a key the space no longer presents for the network, one the role posted
+  before it was replaced, makes none.
+- An app that predates that does it by hand. Stop the app and whatever runs
+  its device (the linux daemon, the windows service), remove `.extender_key`
+  from that process's local state, and start it again: the sdk creates a key
+  when the file is absent (B1). With the automatic key, a network that has a
+  key of its own runs under it, so making it a new key by hand means removing
+  `.extender_network_keys` too. Mobile apps have no extender role (G1).
+- A space with no local state has nowhere to keep a second key and makes none:
+  its embedder keeps the identity and replacing it is the embedder's. The sn
+  miner: stop it, remove `.provider.extender.key` from its state
+  directory (`~/.urnetwork` or `URNETWORK_STATE_DIR`; with `--all-operators`,
+  that operator's directory under `operators/`), and start it again.
+- `connectctl extender`: point `--extender_key_file` at a new path, or remove
+  `.extender_key` from `--state_dir`. With neither flag every start is a new
+  key (G4).
+
+A move of a key to another network is a correction support makes to the row by
+hand; no activation does it. It is made only for the verified admin of the
+network that holds the key, with the operator's approval, and naming a key or
+holding its file is no ground for one. The records then carry no camouflage key
+until the new network's own passing activation posts one (P6).
+
+What support tells someone refused: what the refusal means, and that it touches
+only the extender role; that an updated app makes the new key on its own, and
+how to make one by hand for anything else they run, which is the default
+answer, and that it starts with no history; and that a move is made only as
+above. Support does not say which network holds a key or whose it is, and
+does not ask for a key file or its seed, which are the extender's identity. Only
+public keys and the status text belong in a message.
+
+C3. Uptime probes. Taskworker task every 5 minutes over every active
+address, batched, concurrency 16, a challenge probe over the required path
+the address was accepted on (C2a), 15 s timeout.
+A failure increments `consecutive_probe_failures`; at 6 the address is
+deactivated. When an extender has no active address it becomes inactive,
+`revoke_time` is set and a revocation publish row is inserted. A success
+resets the counter and stamps `last_probe_success_time`. The read of an
+extender's remaining active addresses is locked, so two probes losing both
+families of one extender in the same tick cannot each see the other still
+active and leave the extender active with no address and no revocation.
+
+A pass's failures count only when the prober could have passed them
+(server 6845ebf36, 2026-11-11; `taskworker/work/extender_probe_common_mode.go`,
+`extender_probe_control.go`). Each family of a pass is judged first: it is
+held as the prober's own fault when at least three quarters of its addresses
+failed and either at least three quarters of its networks lost half or more of
+theirs (with at least 4 networks and 8 addresses in the pass), or the prober's
+control target failed over that family with them -- a tls handshake, before and
+after the pass, with the operator's api host, the destination every probe
+names, which counts only once it has answered in this process. A held family's
+failures record nothing, deactivate nothing and revoke no one; its successes
+count as always, and each held pass logs an error line.
+
+A deactivated address is probed for its return as well as re-activated by a new
+activation (`extender_probe_recovery.go`, `model/network_extender_recovery_model.go`).
+For 72 h after it last worked -- an uptime probe or its activation passed --
+an address the probes deactivated, with the failure count that deactivated it
+and on the ip it was deactivated on, is probed in the same passes with the same
+dial: every pass for the first 2 h, then at most every 30 minutes, after the
+active addresses and never counting toward the pass's verdict. The first time it
+passes the same tcp challenge under the extender's published key at that ip, the
+address is active again with a clean count, and a revoked extender is active
+again with a record queued in the same transaction, issued after the revocation
+so it supersedes it in every directory (B5). Only what the probes took away is
+restored: a dead extender still fails its six probes, is revoked half an hour
+after it stopped answering, and never answers a probe for its return.
+
+C4. Publish tick. Taskworker task every 10 minutes. Drip: select up to 8
+active extenders ordered by the oldest `last_publish_time` (nulls first),
+sign a record for each with its active addresses, insert a record publish
+row, stamp `last_publish_time`. When the active count exceeds what 8 per
+tick rotates within 7 days, the batch grows to keep the rotation under 7
+days so every record is republished before its 14 day expiry: the batch is
+the larger of 8 and the active count divided by 1008 ticks, rounded up.
+Each drip also stamps `record_issue_time`, since it is the newest record.
+DNS: C5.
+
+C5. Geo DNS. Route 53 geolocation routing by continent: AF, AN, AS, EU,
+NA, OC, SA and the default, each an A and an AAAA set at
+`extender.<host>` (env prefix rule of the network space for non-main
+envs), TTL 60, up to 8 addresses per set sampled at random from active
+addresses of that family in that continent and filled from the global set
+when short; the default set samples globally. Beside each location's A
+and AAAA sets goes a TXT set, `extender-<location>-TXT`, holding one
+value per extender behind the addresses those sets answer with: the
+base64 of that extender's `ExtenderGossipMessage`, freshly signed for the
+tick with the root key of C2 in the record shape of the drip, so a record
+fetched from dns verifies exactly as one fetched from gossip. Each
+extender is signed once per tick however many locations answer with it,
+and a dual-stack extender is one value naming both families. A value is
+quoted and split into strings of at most 255 characters, which a
+resolver joins. All sets go in one `ChangeResourceRecordSets` UPSERT
+batch per tick; a set with no addresses is deleted, and a location's TXT
+set goes with its address sets. An operator with no root key publishes
+the address sets alone and logs why once per tick. A record is about 300
+characters, so a TXT answer of the largest set is under 3 KB, within
+EDNS0 and every DoH path; a larger `sample_count` would have to watch
+that bound. No Route 53 health checks. Continent from country through a
+static table in the server. Configuration in `extender.yml`:
+`dns: {enabled, hosted_zone_name, hosted_zone_id, record_name, ttl,
+sample_count, aws_region, aws_access_key_id, aws_secret_access_key}`. The
+zone is named, and the id is resolved once per process through the aws
+sdk's `ListHostedZonesByName` with the host's default credentials; an
+explicit id overrides the name and static credentials override the chain.
+The publisher is an interface with the aws-sdk-go implementation and a
+fake for tests. The operator configuration names `bringyour.com` with the
+record `extender.bringyour.com`.
+
+C6. Gossip service. A new server package `gossip` with `cli/gossip`, one
+replica. It runs a libp2p host (D1) with identity `gossip_identity_key_hex`
+from `extender.yml`, listens with the websocket transport on its service
+port behind nginx at `gossip.<host>` (a `gossip` entry in `services.yml`
+with `websocket: true` and the alias exposed), joins the topic, and every
+5 s selects unpublished rows (`FOR UPDATE SKIP LOCKED`, oldest first,
+64 at a time), publishes each and stamps `published_time`. It never
+originates records itself. The node is built with the member role, zero
+peer target and no extender listener, with connection manager watermarks
+of 512 and 1024 since every member and extender dials it. Its `services.yml`
+entry carries `status: "no"`: the websocket listener owns the service port,
+so there is no status route, and the service is watched through its logs.
+The claim releases its row locks when the claim transaction commits, so
+`SKIP LOCKED` partitions the queue between concurrent drains rather than
+guaranteeing at-most-once delivery; a duplicate after a crash between claim
+and mark is harmless to gossip, and the single replica makes it rare.
+
+C6a. Gossip names. `gossip.bringyour.com` and `gossip.ur.network` are
+ordinary warp service aliases, created once as aliases of each zone's
+`main-lb` name like every other service name in `services.yml`, and the
+certificate follows from the aliases through the warp certificate flow.
+Only the extender name of C5 is published by a task, because it is a
+rotating regional record.
+
+C7. Hello. `HelloResult.ExtenderRootPublicKeys []string` from
+`root_public_keys_hex`, and `GossipPeerId string` (json
+`gossip_peer_id`), the libp2p peer id of the operator node derived from
+`gossip_identity_key_hex`; both empty when unconfigured. A member with no
+peer id makes no operator dial.
+
+### D. Gossip network
+
+D1. Node (`connect/gossip`). go-libp2p host assembled from the swarm and
+basic host with exactly the extender transport (D2) and the websocket
+transport (the default transport set pulls in webtransport, which does
+not build against the pinned quic-go, and would add quic, webtransport
+and webrtc to every binary), noise security, yamux, gossipsub with strict
+message signing and flood publish for locally originated messages (only
+the operator originates, and without it a publish before the first
+heartbeat graft is lost), topic `/ur/extender/<host>/1`, a validator that
+decodes `ExtenderGossipMessage`, verifies the root signature against the
+node's current key list and the `NetworkHost`, and rejects everything
+else, peer scoring at library defaults, no discovery. Every accepted
+message is applied to the directory (E1). Connection manager watermarks:
+8/16 for members, 16/32 for extenders. `Publish` is exposed for the
+operator node. The status is refreshed on a 5 s tick as well as on events,
+since a peer's subscription event can precede the node's own stream to
+it. Measured cost: 1.4 MiB on a darwin arm64 build of the whole sdk, so
+no size ceiling changes. The node's own identity is the extender key when the node
+is an extender, else a per-install key persisted with the extender key
+file.
+
+D2. Extender transport. A libp2p `transport.Transport` registered for
+`/ip4|ip6/<ip>/tcp/443` addresses in place of the tcp transport. Dial runs
+the connect root extender dial with `Service` gossip over the tcp carrier
+to that ip on the tcp port the record names, verifying the outer cert
+with the directory's key for that ip and refusing before any connection
+when the expected peer id is not the one derived from that key, then the
+upgrader (noise and yamux) with the expected peer id, which is derived
+from the extender's ed25519 key. Listen exists only on
+extenders: a listener fed by the extender's gossip accept channel (A8),
+advertising `/ip4|ip6/<public ip>/tcp/443` per activated family. Apps have
+no listener. The operator is dialed at `/dns/gossip.<host>/tcp/443/wss/p2p/<id>`
+(`/dns`, so a v6-only host resolves it too) through the space's own dial
+(`ConnectSettings.DialContext`), or through a dialer the node's owner supplies
+(`NodeSettings.DialContext`); libp2p's websocket transport only listens. See
+the design notes on the node's supplied dialer and on a space's egress
+(2026-11-17).
+
+D3. Peering. Every node keeps a connection to the operator and to up to N
+random active extenders from the directory, N 8 for members and 16 for
+extenders, redialing on a 60 s tick as peers churn. Member apps behind NAT
+are outbound-only and relay along the links they dial. No node presents a
+record to join; validity is the root signature on every message plus peer
+scoring, so a hostile member can only observe the drip and add bounded
+load.
+
+D4. Feed protocol (connect root, no libp2p). Over `Service` feed. The
+client sends `ExtenderFeedRequest{SampleCount, Subscribe}`; the server
+replies with up to `SampleCount` random active records, its own record
+first when it has one, then `end_of_sample`, then, when `Subscribe` is
+set, every record and revocation it applies until the client closes, with
+a keepalive every 30 s. Frames are 4-byte length-prefixed protobuf of at
+most 64 KiB. Server caps: sample 32, subscribers 256; a client over the
+subscriber cap still gets its sample and then the stream ends, and a
+subscriber that falls 64 frames behind is disconnected. The server reads
+the stream so a departed client releases its slot at once. The feed server
+lives in `connect/gossip` beside the node since it reads the same
+directory; the feed client lives in connect root.
+
+D5. Roles (sdk). The role is feed on the js build and when the mobile
+low-memory policy holds, which is a mobile runtime with a process memory
+budget at or below 24 MiB; otherwise member. A persisted setting
+`ExtenderGossipMode` with values `auto`, `feed`, `member` overrides. Every
+app takes a one-shot sample at start; the feed role keeps the subscribe
+stream open, the member role runs the node instead.
+
+D6. No full sync anywhere. gossipsub delivers live messages only, so a
+joining node has no history and gets its initial state from a bounded
+sample (D4, C2 bootstrap). The operator drips (C4), every node relays what
+it hears, and nothing serves the full set.
+
+### E. Client: directory, strategy, startup, storage
+
+E1. Directory (`net_extender_directory.go`). Verified entries keyed by
+public key hold the newest record and revocation (B5). Unverified entries
+keyed by ip come from DNS bootstrap and manual configuration and hold no
+key; they upgrade to verified when a record listing that ip arrives. An
+unverified entry is dialable only when it is manual: a dns or imported
+address without a record is known and upgradable, but it is not a
+candidate, not usable, and does not count toward the low-water mark of
+E3, because dialing it would hand the extender request, destination and
+secret included, to whoever answers at an address nothing has vouched
+for. Each
+address carries local state: success and failure counts, last success,
+last failure, first failure, consecutive failures, hold-until, last use,
+in-use count (kept by ip beside the address, E7). Policy, all settings: hold after a failure 10 minutes
+doubling per consecutive failure to 6 hours; warning means consecutive
+failures at least 1; removal when never succeeded and the first failure
+is older than 24 hours, or when the last success is older than 7 days and
+consecutive failures reach 3; expiry per record with 5 minutes skew;
+revocation immediate; cap 2048 addresses (`MaxAddressCount`), the backstop
+beneath the active records' cap of E6, evicting expired, then
+never-succeeded oldest first, then oldest last success. Manual entries are
+never removed by policy. A hold, a limit (A12) and a latency sample
+(DESIGNNOTES4.md §6) are judged by whichever of the monotonic and the wall
+clock has moved further: the monotonic clock stops while the host sleeps, so
+a sleep counts toward them, and a wall clock set back does not extend them.
+A path change keeps every hold, limit, failure count and latency sample. The
+samples become due a refresh: they keep ranking the candidates until the probe
+pass that follows the first sample on the new path measures them again, each
+new sample replacing an old one, and a resume from a sleep of at least 15
+minutes does the same to those taken before it. A `MonitorValue` publishes change;
+`Snapshot` serves status. Persistence goes through a store interface `Load() ([]byte,
+error)` and `Save([]byte) error` with a JSON envelope `{version, records,
+addresses, country_hint}`, saved coalesced at 1 s after a change.
+`country_hint` is the operator's last country and the time it last answered
+it, `{version, country_code, time_ms}` and nothing more (A10, country lists).
+It has a version of its own rather than a new envelope version, because a
+build discards an envelope of another version whole; a section a build cannot
+read is skipped alone.
+
+E2. Strategy. `ClientStrategySettings.ExtenderDirectory` replaces
+`ExtenderNetworks`, `ExtenderHostnames` and the profile enumeration, which
+are removed along with `net_extender_profiles.go`. `expandExtenderDialers`
+draws up to `ExpandExtenderProfileCount` candidates that are active, not
+on hold and dialable -- verified, or manual (E1) -- preferring verified
+over manual and addresses of a family the host has (`probeFamilySupport`), and creates one dialer per address
+and carrier the record lists, priorities 100 tcp, 110 quic, 120 dns,
+minimum weight `ExtenderMinimumWeight`. `clientDialer.Update` reports to
+the directory. `collapseExtenderDialers` also drops dialers whose address
+is held, revoked or removed, and judges the drop timeout from the later of
+a dialer's creation and its last error, so a dialer that was expanded but
+never tried survives to its first attempt. Expansion interleaves v4 and v6
+candidates so a dual-stack host does not spend its budget on one family. `MaxExtenderCount`, `ExtenderDropTimeout`,
+`ExtenderConfigs` and `SetCustomExtenders` keep their behavior; a manual
+extender still excludes every other dialer.
+
+E3. Network client (`net_extender_network.go`). Owns the refresh loop for
+one network space: load the store; bootstrap by resolving `ExtenderDnsName`
+TXT, then A and AAAA, over the strategy's DoH settings with the system
+resolver as the fallback when DoH yields nothing -- each TXT value decodes
+to a signed gossip message (C5) and is applied with source dns, so the
+addresses it names land verified, while a value that does not decode or
+does not verify under the root keys is logged and dropped; the A and AAAA
+answers are then added as unverified addresses with source dns, which is
+a no-op for an address a record just named, and which are never dialed
+until a record does (E1); the order is what makes dns a verified
+bootstrap, since dns itself is not trusted and the operator's signature
+is; take a sample by dialing `Service` feed on a
+candidate, verified first, tcp then quic then dns carriers, with
+`SampleCount` 16 and `Subscribe` per role; apply the frames; mark the
+initial sample done. In the feed role it keeps the stream and reconnects
+through another candidate on failure with backoff 1 s doubling to 5
+minutes. It re-bootstraps over DNS every 6 hours and whenever fewer than 4
+active entries remain (held addresses count as active here, unverified
+non-manual ones do not, so a client whose operator publishes no TXT
+records keeps re-resolving on the backoff until one appears; the startup
+gate of E4 counts only usable ones), refreshes the root keys from hello
+every 6 hours, and reconnects on network change. Hello is read beside the
+refresh pass, never ahead of it, since it reads through the strategy and
+where only extenders reach the operator it cannot answer before the
+bootstrap has found one; a failed hello is read again after a backoff (1
+minute doubling to 6 hours on the same path), or at once after a path
+change. A pass verifies under the keys in force, the configured or bundled
+ones or the last hello's; with none in force it waits for the first hello
+read, as long as that lasts, and after a read that brought none the TXT
+records wait for keys. Keys that hello installs make the bootstrap due
+again, stop the pass from dialing candidates it chose under the old keys,
+and end a stream to one once its sample is in, so both are taken again
+under them. A blank hello list is no list. A subscribed stream that is
+silent for 90 s, three keepalive intervals, is treated as gone. A
+subscription that ends advances the backoff, which resets only after a
+stream stayed up for the maximum backoff, so an extender that accepts,
+samples and drops is not redialed every second. `Status()` reports feed
+connected, the feed ip, last sample time, last error and whether the
+initial attempt is done, which is set at `end_of_sample` so a served
+sample releases the gate at once.
+
+E4. Startup gate. `parallelEval` waits for the initial sample to complete
+only while the directory has no usable entry and the network client is
+still on its first attempt, for at most `ExtenderInitialSampleTimeout`
+(2 s). A stored directory or a completed first attempt never waits.
+
+E5. Outer verification. A dialer built from a verified record passes the
+key into `ExtenderConfig.PublicKey` (B3).
+
+E6. Active records (GEOMAP §2.1, D26). The directory keeps at most
+`MaxActiveRecordCount` (512) active verified records -- an active key with
+an address that is not held -- which is what a phone can hold and what a
+feed sample, the gossip mesh and a peer pinger (G5) draw from, so the
+directory is linear in nothing but its cap however large the fleet. The
+records on the hinted continent are preferred, then those with a current
+latency sample, then a random sample of the rest: a record new to a full
+directory, from gossip or the feed alike, evicts a random one of the rest,
+possibly itself, and only once none of the rest is left the oldest applied
+measured one, then the oldest applied one on the hinted continent. A held
+record and an expired one are never evicted by it, since their tiers keep
+their own bounds (the address cap and the removal policy of E1,
+`MaxExpiredRecordCount`), nor are the extender's own record, which the
+activator and the pinger keep (`KeepPublicKey`), and a record with a manual
+address. An evicted record takes its addresses with it and comes back as a
+new record when it arrives again; a record the cap takes on arrival is still
+published to the directory's subscribers, whose own caps judge it. The
+records sit in an index of pools (`net_extender_directory_tier.go`), so an
+apply, an eviction and a draw each take constant time, and a store written
+under a larger cap loads within the current one. `SetMaxActiveRecordCount`
+replaces the cap at run time; `<= 0` keeps every record.
+
+E7. Reset (2026-10-05). Extender knowledge is per installation, not per
+account, so a sign-out keeps it, and a local account can therefore poison
+what another account on the device dials; the account screen's Extenders
+section has a "Reset extenders" action instead (K6). `ExtenderDirectory.
+Reset(rootKeySet)` returns the directory to a fresh install's: every record
+and revocation learned from the feed, the mesh, the dns bootstrap, an
+activation's sample or a share, every address with its local evidence
+(successes, failures, holds, limits, latency samples), the manual
+addresses, the continent hint and the operator's last country go, and the
+given root keys replace the ones in force, which drops whatever a hello
+installed (nil is the unconfigured state, which waits for the first hello).
+It writes the store before it returns; a save that read the state before
+the reset is skipped rather than written over it, since a save never writes
+a state older than one already written. The startup gate goes back to no
+client, so the client started next waits out its first sample once (E4).
+It keeps what is not knowledge of other extenders: the identities the
+directory keeps (`KeepPublicKey`), this device's own extender record and
+any revocation of it, verified again under the new keys, with fresh
+evidence for its addresses; the settings, the active cap in force and the
+subscriptions; and the live use of each address, which is kept by ip
+whether or not the address is known, because a connection made through an
+extender outlives the reset: its release balances its hold, and an address
+learned again while it lives is reported in use. A record or revocation
+whose verification began before the reset is dropped when it reaches the
+apply. Everything else that writes learned state is stopped by its owner
+first. In the sdk, `NetworkSpace.ResetExtenders()` mints a reset id (a
+ULID) and, through the manager so the values are persisted, clears the
+user-added extender values (`NetExtender`, `ExtenderDnsName`, `GossipUrl`,
+`ExtenderRootPublicKeys`, `ExtenderHosts`) and sets
+`NetworkSpaceValues.ExtenderResetId`. The in-place apply closes and joins
+the network client and the node, resets the directory to the root keys of
+the values in force -- the bundled table for the host -- records the id in
+`.extender_reset_id` beside `.extenders` (after the directory's own write,
+so a process that ends in between resets again rather than not at all),
+sets the custom extenders, which drops every extender dialer drawn from the
+old directory, and starts a new client and node, which read hello and
+bootstrap as on a first run. One restart runs at a time. A live extender
+path keeps running: the platform transport's connection through it is not
+closed, an in-flight request finishes on its connection, the idle pooled
+api connections through the dropped dialers close, and every dial after the
+reset draws from the fresh directory.
+
+The id travels with the values, so every process that holds the space
+applies the reset once: a space applies one whose id is newer than the one
+its storage last applied -- at construction, in the in-place apply of an
+import, and before a rebuild, where the space being replaced is stopped and
+reset first so its close cannot write back what the reset cleared.
+`NetworkSpace.ApplyExtenderReset(resetId)` applies one minted elsewhere;
+an applied or older id changes nothing. A press always resets, even when a
+clock set back mints an id older than the applied one. Process paths: on
+ios and macos the app's `DeviceRemote.ResetExtenders` resets the app's
+space and hands the id to the packet tunnel extension
+(`DeviceLocalRpc.ApplyExtenderReset`), queued for the next sync while it
+cannot be reached; the windows service and the linux daemon take a
+`reset_extenders` control verb with the space key and the id and apply it
+to that space of theirs, which the session device and the provider-only
+device both run in; and in every case the next import of the space, which
+carries the id, applies it at the latest. On a daemon that several users
+share, an older id carried by another user's space applies nothing. A
+hosted device never resets: its space is the proxy host's. What a reset
+keeps beyond the directory's own list: `.extender_key`, the gossip mode,
+`.provide_extender` and the bootstrap DoH servers, which are not extender
+knowledge. A reset, like a sign-out, therefore leaves the device with the
+identity key it had, which stays registered to the network that first activated
+it: under another network's account its activations are refused until the key
+is replaced (C2c).
+
+### F. SDK surface and network space
+
+F1. Network space values gain `ExtenderDnsName` (default `extender.<host>`
+with the env prefix rule, `<env>-extender.<host>` for non-main envs),
+`GossipUrl` (default `wss://gossip.<host>` with the same env prefix rule
+but never the env secret path, since a multiaddr carries no path and the
+gossip service has none) and
+`ExtenderRootPublicKeys`. `NetExtenderAutoConfigure` and its getter are
+removed; `NetExtender` stays. A url-only space, whose key host is not a
+dotted name, derives its network host, extender dns name and gossip url
+from the api url host by the shared label rule (`api.bringyour.com` gives
+`bringyour.com` and `extender.bringyour.com`), and takes its root keys
+from the bundled table for that derived host, so an embedder such as the
+sn miner discovers and activates like a stored space. The bundled table
+carries the operator's key under `bringyour.com` and `ur.network`. `NetworkSpace` constructs the directory, the
+store at the space's local state directory as `.extenders` beside the
+other dot files (memory only without a storage path),
+the network client, and in the member role the gossip node, at
+construction, and closes them with the space. cgo exports and js types are
+regenerated.
+
+F2. Status. `NetworkSpace.GetExtenderStatus() *ExtenderStatus` with
+`Role`, `FeedConnected`, `FeedIp`, `GossipConnected` (at least one mesh
+peer), `GossipPeerCount`, `KnownCount`, `ActiveCount`, `WarningCount`,
+`HoldCount`, `LastSampleTime`, `LastError` and `Extenders
+*ExtenderInfoList`; `ExtenderInfo` with `Id` (base58 of the key, empty
+when unverified), `Ip`, `IpVersion`, `Carriers` (comma-separated, since
+gomobile binds no string slice), `CountryCode`, `State`
+(`active`, `warning`, `hold`, `unverified`, `revoked`, `expired`),
+`Source` (`dns`, `feed`, `gossip`, `bootstrap`, `manual`),
+`LastSuccessTime`, `LastFailureTime`, `SuccessCount`, `FailureCount`,
+`InUse`, `ExpireTime`. `AddExtenderStatusChangeListener` coalesces to one
+callback per second. `GetExtenderGossipMode` and `SetExtenderGossipMode`
+persist D5.
+
+F3. Provider status. `DeviceLocal.GetExtenderProvideStatus()
+*ExtenderProvideStatus` with `Enabled`, `Listening`, `ListenError`,
+`ActivatedV4`, `ActivatedV6`, `Ipv4`, `Ipv6`, `LastActivationTime`,
+`LastActivationError`, `RevokedTime`, `ConnectionCount`, plus
+`GetProvideExtender`, `SetProvideExtender` persisted in local state as
+`.provide_extender` (default true), and a change listener. These follow
+the `GetProviderFamilyTransportStatus` precedent on `DeviceLocal` only,
+since the role exists only on desktop builds where the device is local.
+Refined 2026-10-06 (owner: "make it configurable so the devicelocal can
+set the default extender on or off ... default to be on"): the default is
+the device's, `DeviceLocalSettings.DefaultProvideExtender`, on in
+`DefaultDeviceLocalSettings`, and applies while the space stores no
+`.provide_extender`. Only an explicit `true` or `false` is a stored value;
+a missing, unreadable or corrupt file defers to the device default. A
+space that keeps no local state (`NewNetworkSpaceManagerNoStorage`, a
+url-only space) holds the value `SetProvideExtender` sets on the device
+for the device's life, where it was previously dropped and the setting
+always read on. The order is in G1.
+
+### G. Provider extender role
+
+G1. Eligibility. Compiled for desktop and connectctl only, build tags
+`!ios && !android && !js`, so mobile binaries carry neither the extender
+server nor the role. Default on with the opt-out of F3, plus an embedder
+switch `DeviceLocalSettings.ProvideExtenderEnabled` for a process that runs
+many providers, which the miner swarm turns off, and never on a hosted
+device, which cannot provide. With the device default of F3 the role runs
+while the device provides in this order: never with the embedder switch
+off, whatever the setting says (the status reads `not_providing`); else as
+the user's setting says, when the space stores one or the device holds
+one; else as `DeviceLocalSettings.DefaultProvideExtender` says. An
+embedder that wants the role only after the user opts in turns the default
+off. `NewDeviceLocalWithProvideExtender(..., keyMaterial,
+provideExtenderEnabled, defaultProvideExtender)` carries both controls with
+the key material, also over the c abi
+(`urnet_new_device_local_with_provide_extender`) and the language bindings
+on it. Hosts that build the settings set the two fields: Go and gomobile on
+the settings of `NewDeviceLocal`, a c host in the settings json it reads from
+`urnet_default_device_local_settings` and passes to `urnet_new_device_local`,
+which decodes it over the defaults. Every other constructor keeps both on.
+The role's state is re-read after each hand-over to the provider until it
+stands, so a change racing another is never undone by the older one.
+
+G2. Lifecycle in `deviceLocalProvider`. A device whose space's egress is a
+proxy never runs the role: it binds and forwards on this host, outside the
+proxy every other egress of the space takes (owner, 2026-11-18; the note on a
+space's egress). When provide is on and the setting
+is on: load or create the identity key, which belongs to the network space:
+local state's `.extender_key` when the space has storage, otherwise the
+seed an embedder passes through `DeviceLocalKeyMaterial`, otherwise one
+the space generates and hands back through the same key material for the
+embedder to persist (the miner keeps it beside its client key seed); bind
+tcp 443 first, the one port an extender requires, and only then start
+`extender.Server` on it and on udp 443 and udp 4053, plus udp 53 when the
+device opts in (`DeviceLocalSettings.ProvideExtenderDnsPrivilegedPort`,
+L2), each udp carrier bound independently and a failed udp bind disabling
+that carrier alone; the forward dialer is
+the device's egress-aware connect dial narrowed by family, and it and the
+datagram relay's dialer carry the provider dial control, which refuses before
+the socket connects an address a destination name resolved to that is not
+public or is the provider host's own, on one of its links, an observed
+address or service anycast (IP_SECURITY.md §2.2.4); its failures
+(A7) are logged, the first of each kind at once and then at most one line a
+minute carrying the count since, so an extender whose egress cannot reach
+the operator says so (connect#230); the whitelist is
+A5 from the space hosts plus the spoof list; the space's node is rebuilt
+with the extender role, the in-process listener, the feed server and the
+listen addresses of the activated families, so it becomes a listening
+node. Bind failures log
+once and are reflected in the provide status, never as a user-visible
+error; a failed udp carrier stays down until the role restarts with provide
+or the setting. Decided 2026-10-06 (owner, relayed by the sn session: "the
+miner should try to acquire the required extender ports and if it can't
+then turn off extender. The only required extender port is port 443 tcp.
+443 udp and 4053 udp and 53 udp are optional."), for every app platform and
+the miner alike: while the tcp 443 bind fails the role is off -- no udp
+carrier, no node, no activation, no peer pings -- the status says why
+(`TcpUnavailableError`, N2, N3), and the bind is tried again every 3
+minutes, the role starting the moment it holds the port. So of several
+provider processes on one host, such as the miner's per-operator children,
+the first to take tcp 443 serves the extender, the others turn it off, and
+the role moves to one of them within a retry of the holder exiting. The
+feed server is wired to the extender's feed handler,
+and the node carries the in-process gossip listener; the node is rebuilt
+whenever the set of activated addresses changes so no stale address is
+advertised. When the user has chosen the feed-only gossip mode, the role
+runs the server and the feed service without a node and refuses the gossip
+service.
+
+A carrier that has bound and then fails does not end the server, and does not
+touch the other carriers (`connect/extender/extender_carrier.go`). An accept
+error that is a passing condition of the host (file descriptors, memory, a
+connection that went away while it queued, a network error pending on the new
+socket) is waited out on the same listener, 5 ms doubling to 1 s as net/http
+does; if it goes on for 30 s the port is reported lost until its accepts stop
+failing. Anything else that ends a port (a listener that closed, a udp socket
+whose read fails, a panic) is logged at error level with its cause and the port
+is bound again after about 1 s, doubling to 5 minutes with jitter, starting over
+once the carrier has served for 5 minutes. A datagram the dns carrier cannot
+encode or write is lost and nothing more, logged at most once a minute with the
+count since, so one client's address or a path that is down for a moment cannot
+end the socket every client of the carrier shares. Only a closed socket ends it, and
+that holds however long the writes fail: a socket whose every write fails stays up
+and reads as ready, with its line a minute. No count or duration of failed writes
+ends it (decided on review, 2026-11-02): a restart could not cure egress that
+refuses every write, and `TestPacketTranslationServerOutlivesWritesThatAllFail`
+keeps such a bound from coming back. `Carriers` and `DnsPorts` say what is serving
+at each moment, and a probe's response, the status and the activation all read
+them. A first bind that fails is still the case above: that udp carrier stays down
+until the role restarts.
+
+The server itself ends only with `Close` or its context. The role reports its
+tcp carrier: `Listening` is true while it serves, and while it is lost
+`ListenError` carries what ended it, no family reads as activated, and no
+activation is posted (G3, N3). A tcp carrier still lost after the 3 minutes of
+the bind retry, a server that ended under a running role, which nothing does but
+a bug, or a role's loop that panicked makes the role ask the provider for a new
+one, after a further wait of 1 minute and a draw of up to 5, a spread that doubles
+to an hour while the replacements do not last. A role whose loop panicked says so in
+its status through that wait. The new role is the one this section describes:
+serving, or off for want of tcp 443 and retrying it, with no udp carrier held
+against the process that took the port. It keeps what the old role's activation
+held (`ExtenderActivator.State`): a family waiting out a hold, a
+`retry_after_seconds` or a private family's day goes on waiting, a post the gate
+held back goes within 5 minutes, and a family that stands activated keeps its status
+and is posted once more within the hour, since a new role has things only a post
+gives it (the record the camouflage gate reads, the ports that bound this time). So a
+fleet whose roles are replaced together does not post together. Turning the role off
+and on starts it as a new process does. The node stays as it is while the tcp carrier
+is lost: the carrier usually returns within seconds, finding the addresses as they
+were, and a port that stays lost gets a new role and a new node.
+
+A role rebuilds rather than exiting the process: it is the spare capacity of a
+provider that is serving (G1), and a desktop app has no supervisor to restart it.
+connectctl, which exists only to run the extender, exits with an error instead (G4).
+
+Decided 2026-11-02 from an outage of one operator's extenders on 2026-11-01. Of
+about 190 active extenders, 147 were revoked from 20:00Z. 131 of those went on
+posting, so their processes were up, while 46 of 47 sampled addresses did not answer
+on tcp 443, and the 10 that refused it when udp 53 was sampled refused that too.
+One accept error, one udp carrier's exit or one failed write on the dns carrier used
+to close every carrier for the life of the process, nothing restarted the server,
+and the status went on saying listening while the activation went on posting. That
+is probably what happened: a real EMFILE reproduces the state, but no host's log
+confirms it, and which failure it was is not known.
+
+`ErrorHandler` hears no client's address (`connect/extender/extender_error.go`). A stage
+reports its name and one class of failure: an errno, a timeout, a close, or a constant
+the site names, and nothing of the text or the chain of the error it came from, so a new
+stage or a new kind of error is scrubbed with nothing further done. Only `forward dial`,
+`datagram forward dial`, `nlayer hop dial` and `nlayer probe dial` keep the whole error,
+since each dials what the operator named (A5, A7, A11) and the client's address only
+chooses the family. Those are what an operator reads, and the role logs the first two.
+
+The extender's http servers keep no log of their own, since every line of theirs an
+operator might read names the client or repeats what the client sent: a broken h2
+greeting, a frame that cannot be read, a panic. The one that matters is the panic, so
+the handler catches its own and logs that it happened and where in the code, from the
+binary and with nothing of the value or the request, and `ErrorHandler` hears it as the
+stage `handler panic`. The gossip listener and the feed server, which the role installs on
+the gossip and feed services, log neither a connection's address nor the text of its
+socket's error.
+
+G3. Activation loop. Each family keeps its own schedule. A family is posted
+at start, on its own 24 hour tick, and when a trigger makes it due: the own
+key observed revoked in the directory and a network change make every family
+due, and the hourly caller address check makes due the family whose address
+moved. A pass posts the families that are due, in ip version order, each to
+its family api url with the client jwt through a direct-only client
+strategy, since an activation that crossed an extender would publish the
+extender's address; it applies the bootstrap records to the directory and
+records the status. A success moves the family to its tick. A failure holds
+that family alone, 10 minutes doubling to 6 hours, and a success resets its
+hold, so a family the operator keeps refusing never re-posts one that works.
+A refusal that carries `retry_after_seconds` (C2: a spent activation budget,
+or an operator too busy to probe; connect#230) holds its family exactly that
+long, at least 1 minute and at most 6 hours, whether or not the family is
+private, and leaves its hold as it was: the operator probed nothing. An
+operator that predates the field gets the hold. A refusal of the key as
+another network's (C2c) holds its family until its tick and leaves its hold as
+it was, since no wait changes it, and is told to the role (`OnRefused`), which
+makes a key of the network's own when it can (2026-11-03).
+A family without a global address on the host (`FamilySupported`) is not
+posted and is looked at again every 10 minutes, without doubling, since the
+look is local; one that gains an address is posted within 10 minutes however
+long it went without one, and its first failure after that holds 10
+minutes. A family whose global addresses on the host are all private (RFC
+1918, RFC 4193, carrier-grade NAT, the 464XLAT range; `FamilyPublic`) can
+be dialed back only through something that forwards to it: it is posted at
+start, on its tick and on every trigger as any family is, and a refusal of
+it while it has not activated holds it until its next tick instead of the
+backoff, since a NAT that never forwards refuses every retry alike. It has
+activated once it has since start, or once the directory holds this
+extender's own current record naming an address of the family, which is the
+operator's word that it published the family after its probes passed and
+which carries a restart. Only the newest record of the key counts
+(`CurrentRecordNamesFamily`): a revoked or expired one does not, nor does an
+address an older record named that the newest no longer does, though the
+directory keeps that address, nor one another key has claimed since. The
+schedules move once every post of the pass is answered, so the record
+another family's answer brings counts too. Once it has activated, something
+forwards to it, so its refusals -- the operator's budgets, a probe that
+failed, the re-post of a revocation -- are held on the backoff as any
+family's are. An interface table that cannot be read counts as public here,
+so it never lengthens a hold by itself. A family with a public address is
+held the same way when the operator's required test found no answer from it
+while it has not activated (`ExtenderActivateResult.RequiredTestUnreachable`:
+the tcp step of `probe_steps` failed or ran out of time, C2b, or from an
+operator that predates the steps, an `error` that says the tcp carrier did not
+answer or failed): a firewall that keeps the internet out, or a router that
+does not forward the port to a host it gives a public address, refuses every
+retry alike, as the NAT does. Decided 2026-11-03 for the extender behind NAT
+(support inbox 8154): the role stops retrying on the backoff, and the status
+says what it needs (N3's `activation_unreachable`). It is still posted on
+every trigger and on its tick, so a host whose port is opened activates
+within the day, or at once on a network change or a restart of the role
+(turning Extender off and on). Every other refusal of a public family, and
+every refusal of a family that has activated, is held on the backoff as
+before. The
+measurement request rides the first post of a pass that can carry it
+(lag.dev/PLAN.md C4); when a pass activated a family and no post carried a
+request that is wanted, the families it activated are posted once more at
+once, and that post is followed by no other. The address check is one
+hello, to the plain api url, compared within the family it arrived on and
+by the address, not the port: an address the operator published for any
+family is unchanged, and so is the one the last check saw on that family
+while the family's published address is still the one that check was read
+against (an activation that moves the published address forgets it), so a
+dual-stack host whose hello arrives on either family, or a host whose hello
+leaves from another of its addresses than its activation, posts nothing,
+and a host that returns to an address it left is posted at the next check;
+a family that is not activated is left to its schedule. An
+operator with no family api hosts is posted once a cycle to its plain api
+url on one schedule. The ticks, the hourly check and the holds count the
+time the host slept: a minute after waking from a sleep of 15 minutes or
+more, what came due during the sleep is due. Per-family schedules decided
+2026-11-01 from the lag.dev health check: one schedule for both families
+made a v4 behind a NAT, refused at every post, re-post the working v6 on
+every step of the shared backoff (every 6 hours at the cap, 4 to 7 times a
+day where 1 was due), and one hello compared with the last read every
+dual-stack host's switch of family as a moved address and re-posted both.
+Revised the same day on review: the day's hold of a private family's
+refusal was any refusal's, so a revocation's re-post refused once left an
+activated family unposted for a day; the address a check saw outlived an
+activation that moved the family; and the look for a family without an
+address doubled to 6 hours. A second review carried "activated" across a
+restart, through the directory's own record, so a forwarded family whose
+first post of a run is refused by the operator is not held for the day; a
+third read that record's newest body alone rather than every address the
+directory keeps for the key.
+
+No family is posted while no required carrier is serving (G2, C2a), which today
+means the tcp carrier: the operator refuses a list without it before it probes
+anything, so such a post could only be refused, and holding it back saves that round
+trip and keeps the status saying what is wrong. What keeps a closed port from being
+probed, and the budget the account's other extenders share from being spent on it, is
+`Carriers` being true (G2). A family that comes due meanwhile, by any trigger, is held
+back with the reason in its status. That asked nothing of the operator, so its hold
+does not double, and it is looked at again after 10 minutes, which is what finds a
+carrier whose return nothing announced. When the tcp carrier returns
+(`ExtenderActivator.TcpCarrierReturned`) the families held back are posted, each after
+a draw of up to 5 minutes (`CarrierReturnJitter`) so a fleet that lost its listeners
+together does not post together. Nothing else moves: a family that stayed activated
+stays on its tick, and one waiting out a hold, a `retry_after_seconds` or a private
+family's day goes on waiting, so a listener that flaps posts nothing it would not have
+posted anyway. A post that went out while another carrier or a dns port was down leaves
+it off the record, so its return (`ExtenderActivator.CarriersChanged`) makes a family
+activated without it due, after the same draw. If it has gone again when the draw comes
+up, the post could not name it, so it is not made and the family stays on its tick. A
+carrier that goes and comes back with the record already naming it posts nothing.
+
+Every post names the run of the process that sent it (2026-11-02): `run_id`,
+32 lower case hex characters of 128 random bits drawn once when the process
+starts, so every activation of one process carries the same id and a restart
+a new one; `run_start_time`, when the process started, in utc; and
+`previous_exit`, how the run before it ended, when the host that restarted the
+process says so in the environment variable `URNETWORK_PREVIOUS_EXIT`. Its
+words are `oom` (the host knows the run ran out of memory), `stop` (the host
+stopped it on purpose), the signal that ended it (`sigkill`, `sigterm`,
+`sigint`, `sighup`, `sigquit`, `sigabrt`, `sigsegv`, `sigbus`, `sigill`,
+`sigfpe`, `sigtrap`, `sigpipe`, `sigalrm`, or `signal` for another), and
+`exit-<code>` for an exit code from 0 to 255. The sn miner's supervisor sets it
+for a provider child it restarts; a process restarted any other way has none.
+All three are optional: an operator that predates them ignores them and an
+extender that predates them omits them. The operator stores each on the
+activation's history row when it is well formed -- 32 hex characters; a start
+no earlier than 2026-11-01 and no later than an hour past its clock; one of
+those words -- and null otherwise, and never refuses an activation for a
+well-typed value, since an extender with a wrong clock must still be published.
+A restart is then a run that started recently among an extender's activations,
+rather than something inferred from its platform connections. The process is
+what has a run, so every slot of one sn miner shares it, and separate processes
+on one identity key are a run each, which count as restarts only when they
+start. The queries are in EXTENDER-ACTIVATION.md §7.
+
+G4. connectctl gains `extender`, a standalone extender for operators and
+tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,
+`--allowed_host` repeated, `--nlayer-hop` repeated (A11), `--state_dir`,
+running G2 and G3 without a provider. It derives the network host from the api host by dropping the
+service label and the extender dns name by replacing it, keeping an env
+prefix, takes its whitelist from the api host patterns plus the flags,
+does one synchronous hello at start to seed the root keys, and keeps its
+key at the state directory when no key file is given or runs with an
+ephemeral identity when there is neither. A carrier that is lost is rebuilt as in
+G2, and a server that ended, which it has no role to replace, exits with an error
+for whatever runs it to restart.
+
+G5. Peer pinger (GEOMAP §2.1). The role and connectctl's extender run an
+`ExtenderPeerPinger` over the space's directory, which pings at most
+`PeerSampleSize` (64) peers: the nearest by the continent hint first, and the
+rest a random slice of the others drawn again every refresh, so one day's
+pinging is linear in the fleet while over days a source's pings spread
+across it; a member keeps its schedule until it is rotated out, and `<= 0`
+pings every peer.
+
+### H. Packages and dependencies
+
+- connect root: protocol changes, `extender_record.go`,
+  `net_extender.go` (carriers, request, verification),
+  `net_extender_spoof.go`, `net_extender_probe.go`,
+  `net_extender_directory.go`, `net_extender_feed.go`,
+  `net_extender_network.go`. No libp2p.
+- `connect/gossip`: node, extender transport, feed server, in-process
+  listener. Imports go-libp2p and go-libp2p-pubsub. Imported by the sdk
+  except on js and by the server.
+- `connect/extender`: server, carriers, HTTP handlers, reverse proxy, DNS
+  forwarder, certificates, limits. It does not import `connect/gossip`:
+  the reserved-service handlers are plain callbacks, and whoever runs both
+  (the sdk provider role, connectctl) wires the listener and the feed
+  server in. Built for desktop and connectctl.
+- server: model, handlers, controller, taskworker work, Route 53
+  publisher, `gossip` service, `cli/gossip`, migrations, hello.
+- sdk: network space fields and lifecycle, status types, store, roles,
+  provider role, local state settings, regenerated bindings.
+- vault: `services.yml` gossip service and alias for main; `extender.yml`
+  keys documented here, created by operations.
+- Package layering per CODESTYLE: root never imports `gossip` or
+  `extender`; `extender` imports `gossip`; both import root.
+
+### J. Contract parties and payouts
+
+J1. Connection tag. At connect, the server matches the caller address
+against the active extender addresses, cached in process and refreshed
+every 60 s, and stores `extender_id` on `network_client_connection`.
+Address matching is the attribution today. A whitelist of trusted
+extenders forwarding over a dedicated edge port with a PROXY protocol
+header, which also restores real client addresses, is a later step.
+
+J2. Parties. When a contract, a no-escrow contract or a companion contract
+is created, the distinct extenders tagged on the currently connected
+connections of the source client become its source extender parties and
+those of the destination client its destination extender parties, written
+in the creating transaction to `contract_extender (contract_id,
+extender_id, party, client_id, network_id)` with the primary key
+`(contract_id, extender_id, party)`, `party` being `source` or
+`destination`, and `client_id` and `network_id` the extender's provider
+client and network. Zero to many rows per contract; the rows are deleted
+with the contract. A contract need not carry its data over the extender:
+every active extender of an endpoint counts, which is fuzzy but averages
+to the right allocation.
+
+Only a tag that can be a relay is a party (owner, 2026-11-11: only real
+relays earn), since a connection is tagged by its caller address alone and
+a client on the extender's own address is tagged as if the extender
+carried it. Three tags carry nothing and make no party
+(`contractExtenderInsertSql` in the server):
+- the extender's own network's: its own provider client, and the clients of
+  its network behind its address;
+- a public provider's (J4);
+- that of an extender reached over the webrtc carrier alone, on an endpoint
+  that holds no connected connection elsewhere, nor does the client it is
+  derived from. Such an address is no first contact: the carrier signals
+  through the dialer's own connection to the platform (S8), and a window
+  client is derived from the client that signals, so a relayed endpoint
+  always arrives beside one. Without one the endpoint shares the extender's
+  address, a host behind the same nat (2026-11-16: one such extender was a
+  party to every contract of 84 clients of two other networks behind its
+  address).
+
+A client of another network behind the address of an extender that is a
+first contact -- tcp, quic or dns -- is still tagged as a relay: nothing on
+the connection tells the two apart until a client declares the extender it
+dialed.
+
+J3. Payout. Participant gathering unions the contract's extender rows into
+the participant set. Every hop has equal weight, intermediary, egress and
+extender alike, so the even split applies unchanged; an extender on the
+payer's own network earns nothing by the existing exclusion, and an
+extender whose provider client is already a participant is counted once,
+since the set is keyed by client id.
+
+J4. Public providers do not use extenders. A provider whose provide mode
+includes public dials the platform on its egress on every transport, the
+standby included: from this host, or through its proxy if it has one
+(owner, 2026-11-18; the note on a space's egress). So the platform observes
+the address the provider's exit leaves from, and places the provider there;
+a provider in network mode may keep using extenders, since network peers
+carry no location metadata. Destination extender parties are therefore
+expected to be empty for public providers. A change of provide mode that
+flips this rebuilds the provider transports.
+
+J5. The legacy extender columns of `audit_contract_event` stay unused; the
+join table is the record.
+
+### K. App user interface
+
+K1. Which extender a provider uses. The extenders shown on a provider dot
+are the client's: the extender addresses carrying this client's live
+platform transports to that exit, usually zero or one, briefly two during
+a transport migration, none over a P2P route. They never represent
+extenders the provider itself may use. Plumbing: the client strategy's
+websocket dial reports the selected dialer's extender ip, the platform
+transport keeps the set of ips of its live connections, the window monitor
+carries them on `ProviderEvent.ExtenderIps` and updates them through
+`SetProviderExtenderIps` as `SetProviderIpFamily` does today, and the sdk
+grid point carries `ExtenderIps` and `ExtenderColorHexes` in the same
+order. Provider events are already mirrored over the device rpc, so the
+iOS app process receives the fields unchanged. As built, the api generator
+installs one change counter per window client in
+`PlatformTransportSettings.ExtenderIpsMonitor`, which the transport
+increments, so a watcher survives a transport migration; the generator
+exposes the ips through `MultiClientGeneratorWithExtenderIps`.
+
+K2. Dot outlines. A provider with extenders is drawn as a filled dot with
+one ring per extender, in the extender's color (K3): stroke 2 px, a 2 px
+gap between the dot and the first ring and between successive rings, and
+the outermost ring's outer edge at the cell edge, so the dot's footprint
+never grows into a neighbor: the filled dot shrinks inward by 4 px per
+ring. At most three rings are
+drawn; four or more collapse into a dashed third ring, in the third
+extender's color. The connect grid's default cell is 16 pt, which holds
+one full-size ring; apple drops rings that cannot fit and dashes the last
+drawn one, android scales stroke and gap down together once the fill would
+fall below a quarter of the dot radius so the count is preserved, both
+pinned by tests. The drawer's ip family section drew the same dots and
+rings at its dot size until it became the text-only status row on every
+app (IPV6.md D2, 2026-09-21), and the grid signature includes the extender
+ips and the ip family so a change in either republishes the grid.
+The panel is hidden while there are no extenders at all.
+
+K3. Extender color. One color per extender ip, computed once in the sdk
+by `GetExtenderColorHex(ip)` in the untagged color file so the iOS
+extension exports it too: FNV-1a 32 over the canonical ip string, hue is
+the hash modulo 360, saturation 70 percent, lightness 55 percent, as a
+hex rgb string. Every app draws the value as given.
+
+K4. Extender panel. In the connect drawer under the ip family panel. Left
+to right: one hollow ring per active extender in its color, where active
+means carrying at least one live connection right now, then the count as
+"N of M" where M is every usable directory entry (active state, not on
+hold), then a status dot for the gossip network: green connected (a
+member with at least one mesh peer, or a feed app with its stream up),
+yellow connecting (a dial or reconnect in progress), red disconnected
+(nothing in progress: backoff, no candidates, or disabled), with the count
+of records and revocations applied from the feed or the mesh in the
+trailing 60 s. Tapping does nothing yet; there is no details panel.
+
+K5. Status source. `ExtenderStatus` moves onto the device:
+`Device.GetExtenderStatus()` and `AddExtenderStatusChangeListener` on
+`DeviceLocal`, read from its space, and on `DeviceRemote` through the rpc
+with the last value cached, exactly as the provider family transport
+status, so every rpc consumer gets it. The status gains `GossipState`
+(`connected`, `connecting`, `disconnected`), `EventCountLastMinute`, and
+`ActiveCount` redefined as K4's active; the directory keeps a 60 s ring
+of apply times, counting only applies that changed it (a superseded or
+duplicate record is not an event), and reports the in-use count per
+address and in total. On iOS the app
+process keeps its own directory for api dials but opens the shared store
+read-only, so only the tunnel extension writes `.extenders`.
+
+K6. Settings. Under account, a section named Extenders, per network
+space, editing three values through `UpdateNetworkSpaceValues`: the
+extender dns name, the gossip url, and a new `ExtenderHosts []string` of
+hostnames or ips. Empty fields show the derived default as a placeholder
+and mean the default. The list supplements discovery: each entry is a
+manual bootstrap address, hostnames resolved over DoH and re-resolved
+every 6 hours, never removed by policy, unioned with the dns bootstrap and
+everything the feed and the mesh deliver. The legacy single private
+extender with a secret stays as an advanced field with its exclusive
+override. Saving restarts the space's network client and node in place;
+on iOS the tunnel extension picks the values up at its next start and the
+app says so. The section's "Reset extenders" action (E7), behind a
+confirmation that says the added extenders are removed and everything
+learned is cleared, clears these values and the directory together.
+
+K7. Share and import. The section has "share extenders" and "import
+extenders". The share payload is `ur-ext:1:` followed by base64url of
+`ExtenderShare{version, network_host, addresses (4 or 16 bytes each),
+settings{dns_name, gossip_url, root_public_keys}}`, addresses only, at
+most 48, active first, then usable, then manual; keys and records are not
+shared, since an imported address is an unverified bootstrap entry that
+upgrades when a record arrives over the feed. "Include extender settings"
+adds the settings block, off by default. The QR renders at error level H
+with the black and white connector glyph centered and a 4 px outline of
+the connector shape around it; the share screen also shows the payload as
+copyable text with a copied confirmation. Import accepts a scanned code, a
+chosen photo, or pasted text. A share of 48 addresses with settings can
+exceed what a version 40 code at level H holds; the screen then hides the
+code, keeps the text, and says so. Rendering snaps the module size to
+whole pixels, since a fractionally scaled code does not decode. An import whose network host differs from the space's is refused
+unless "use extender settings" is chosen, which shows the operator host
+and asks to confirm before replacing the dns name, gossip url and root
+keys; the first hello over the platform's pinned TLS replaces the root
+keys again, which bounds a hostile code. Encoding, decoding and building
+live in connect root (`net_extender_share.go`) and the view controller in
+the sdk applies them, one implementation for every app. An imported
+address has the source `import` and stays under the removal policy;
+only `manual` entries, including a manual host's resolved addresses, are
+exempt.
+
+K8. Platforms. Android: camera scan with CameraX and zxing decode plus
+the photo picker, never ML Kit, which the F-Droid build cannot carry.
+iOS: VisionKit camera scan and Vision for photos; macOS: photos and files
+only. Windows and linux: the code renders through a vendored single-file
+encoder, import reads an image file through zxing-cpp plus pasted text,
+no camera. Web app: out of scope, its device is hosted and never dials an
+extender. Every string goes through the localizations repo with the
+platform list of each key; the keys were added once by the coordinator and
+each app regenerates only its own catalog. On linux the account section is
+a group inside the always-visible account pane rather than a fourth pane,
+and the legacy private extender written there steers the gui's own api
+dials but not the daemon's tunnel, which keeps its own network space; the
+other settings reach the daemon through the device's view controller. On android the settings form needs a signed-in device and the private
+extender goes through the space manager. On windows the section is a
+fourth account pane taking the third fold slot, which needs 1500 dip, and
+the settings edit the app process's space that the service imports at its
+next session start, so the "next time it connects" note applies there as
+well as on iOS; the connector path is shared by the canvas, the login
+carousel and the share code. The linux release container adds
+`libzxing-cpp-dev`; the windows build fetches zxing-cpp and vendors the
+Nayuki encoder.
+
+K9. Provider rows (2026-10-22). The provider details sheet, the connected
+providers with their globe, shows the same extenders as the connect grid.
+`ConnectedProviderLocation` carries `ExtenderIps` and `ExtenderColorHexes`
+from the provider's event (K1), comma separated and paired by index as on
+the grid point, through the same `extenderIpsAndColorHexes`, which lives in
+the untagged color file beside `GetExtenderColorHex` because the iOS
+extension builds the provider rows too; the web binding hands the page the
+pairs as `extenders: [{ip, colorHex}]`. A row's dot draws K2's rings at its
+own size, as many as fit at full stroke, and dashes the last one drawn when
+more extenders remain: apple's dots (40 pt on iOS, 30 pt on macOS) and
+android's 40 dp hold all three, the 20 px dots on linux and the web hold two
+(the web's grew from 10 px, which held none), and windows' 12 px dot, the
+location chooser's size, holds one. The globe's dots draw them at the dot's
+size in the globe's 600-unit space, scaled with the globe, so a globe dot
+holds one ring and a second extender dashes it. The rows and the globe drop
+the rings that do not fit on every app, even where the grid thins them to
+keep the count (android, windows; K2). The rings run in each app's grid
+order: the first extender outermost everywhere but android, whose grid and
+widget put it innermost. Under the connected time, each extender gets one
+line: a small ring in its color (K3), then its address in the client id's
+monospaced style, copied on a tap. Apple's row context menu also has "Copy
+extender address"; rows without a context menu use the same words for the
+tap (android's click label, the tooltip on windows, linux and the web). The
+address is the extender's id on the rows: every extender has one, while the
+extender's uuid reaches a client only as `MeasurementId` on the open-tier
+records of extenders that serve the measurement API. A direct or p2p
+provider shows neither rings nor lines. Apple came first and every app
+follows it, including the web app, though its hosted device never dials an
+extender (K8), so its rows stay plain until a page runs against a device
+that does.
+
+K10. Staying on an exit through its extender (2026-10-22). "Stay on this
+exit" on a provider row that carries an extender (K9) pins the extender as
+well as the exit: the stayed-on provider is then reached through that one
+extender address and nothing else. Decided with the user:
+- Strict. The pinned destination's transports dial H1 through that address
+  only: no direct dial, no other extender, no H3 (only H1 runs through an
+  extender, K1). When the extender is down, the exit waits and retries it on
+  its own transport's schedule. The directory's hold (E2) does not bench the
+  address for the pinned dials, though their failures still hold it for
+  every other dial. A revoked or forgotten address leaves the exit waiting
+  until the user chooses another location.
+- Saved with the location. `ConnectLocation.ExtenderIp` (json `extender_ip`)
+  sits beside the stayed-on client id, so a restart reconnects through the
+  same extender. A location without a client id carries none.
+- Named in the row's stay text: the offer reads "Keeps this provider's IP
+  address and extender until either goes offline", and staying reads
+  "Staying on this exit through extender <ip>. If either goes offline,
+  choose another location." While the pinned exit is not connected, the
+  sheet's empty state says it is waiting for the exit through that extender.
+  The offer pins the row's first extender; across a migration's two that is
+  the lower address (K1 sorts them), and the stay text names the one pinned.
+  The staying line keeps naming the pin while the provider is reached over
+  P2P, which the pin does not cover (below), rather than offering the stay
+  again. A stay made before the pin, or while the provider was direct, keeps
+  saying it stays and is not offered the pin, as a stayed-on provider never
+  offers itself.
+- As built (2026-10-22) on apple only. The other apps keep the plain stay
+  until they adopt the pin; their sdk already keeps one, so adopting it is the
+  app half alone.
+
+Plumbing. The location's client id becomes the one fixed `ProviderSpec` as
+before, and the pin rides it as `ProviderSpec.TransportHint`, a client-side
+field the find-providers2 wire never carries (`json:"-"`), so the spec
+fingerprint that scopes the window identities is unchanged by a pin. The api
+generator matches each destination against its specs and hands the hint to
+the window client's args; `NewClientContext` then builds that client's
+platform transport with H1 as the only mode, and with a client strategy of
+its own (`newPinnedExtenderClientStrategy`, the per-transport precedent being
+`NewDirectClientStrategy`): no normal, resilient, VLESS, configured or alt
+dialers, and the extender dialers of the pinned address alone, drawn from
+the shared directory through `PinnedCandidate`, which ignores the hold. The
+client closes its strategy with its transport, and a policy migration keeps
+the pin. The transport reports the extender as K1 has it, so the row shows
+the pinned extender while it carries the connection. The pin covers the
+platform transport: a P2P route to the provider (K1) never touches the
+platform, is unchanged by the pin, and shows as no extender on the row. A
+resident move (server/connect/MOVE.md) never retargets a pinned client:
+its carrier is an extender, so an advisory move is declined as an extender
+carrier and a compulsory one migrates it by name, and every transport a
+migration or a move builds for it dials through its own strategy.
+
+Compatibility. A pin is settable state an older device process would drop:
+it decodes `extender_ip` as nothing and stays on the exit alone. Instead of a
+`DeviceRpcVersion` bump, which is an exact match and would turn away every
+cached browser on the hosted path until both halves redeploy, the remote asks
+the local whether it pins (`DeviceLocalRpc.GetSupportsExtenderPin`, read
+through `rpcCallNoArgAllowMissingMethod`). A local without the method answers
+false, and the apps then offer the plain stay without the pin, as the
+provider extender role is gated (N1).
+
+### L. The alt service
+
+L1. What alt is. A full connect node and an api server in one process,
+run on the proxy hosts only, one block per proxy host, with no load
+balancer in front. It joins the exchange like any connect node, since the
+proxy hosts already have vault, database and redis access, and serves the
+alternative protocols directly on public udp: H3 on 443 and whodis on 4053
+(and 53 through the router), terminating QUIC with the real certificates
+and no PROXY protocol. One QUIC listener per socket, both address families bound, dispatches by
+SNI: a connect name goes to the connect handler, an api name to the api
+router mounted on an http3 server in process, anything else is refused
+with application error 0x1000. Alt advertises only the `h3` ALPN: an
+http3 client offering `h3` reaches the api front and the platform
+transport, which offers no ALPN, reaches the connect front, so the
+connect transport must never gain an ALPN without alt advertising it in
+the same change. The service names are those of services.yml, env-prefixed
+and family forms and aliases included, matched case-insensitively. Alt
+keeps an http port for the warp status route only, answering 503 until
+every udp front is accepting; a listener failure ends the process for
+warp to replace it. The whodis listener is
+the decode53 translation under the same dispatch, so whodis reaches both
+the api and connect. The H1 websocket stays on the connect service behind
+the lb. Going forward H3 and whodis are canonical on alt; the connect
+service keeps its lb udp listeners for old clients indefinitely.
+
+Alt is the ingress of its api front and its status listener, since no lb
+stands in front of them (server `alt/ingress.go`). Before the limits and before
+any handler, every request gets the forwarding headers nginx sets for a service
+behind the lb (warpctl `addProxyRequestHeaders`), whatever the client sent:
+`X-UR-Forwarded-For` is the peer the request arrived from, in nginx's form (an
+ipv6 address bracketed, an ipv4-mapped one as ipv4), and `X-Forwarded-For`,
+`X-Forwarded-Source-Port` and `X-UR-Request-Buffering` are cleared; the last is
+the lb's mark for a body it streams, and alt reads every body itself, so a
+route's own body policy applies. Every per-address limit and address-based
+decision behind the api, the activation probe of C2 among them, therefore reads
+the peer. A peer alt cannot read leaves no `X-UR-Forwarded-For`, and the session
+refuses the request. The connect front has no such header: it takes the address
+of the QUIC connection.
+
+L2. Ports. Alt's warp service exposes udp 443 and udp 4053 only, never 53:
+warp gains `external_udp_ports` for host-pinned services, allocating a
+host port per entry through the same `WARP_PORTS` mapping as `ports:` and
+publishing each with the interface-scoped DNAT the lb interfaces use (the
+lb's force map cannot be reused, since it would also DNAT tcp 443 away
+from nginx), while the lb unit on such a host reserves those udp ports so
+two chains never DNAT one tuple; the router in front of the proxy hosts
+DNATs public 53 to 4053. The alt entry is `exposed: false`, one block, no
+aliases and no capabilities, added to `host_services` of both proxy hosts,
+and carried as a new version v22. The whodis port is 4053 everywhere, which is already the
+connect service's dns listener behind the lb (8053 kept for old lbs), so
+alt listens on 4053 and nothing moves; and an extender listens on 4053 always and on 53 only where
+it opts in. Decided 2026-10-06 (owner: "the extender should bind 4053 on
+all app platforms: apple, android, windows, linux. Only the cli sn/miner
+should try to bind 53 in addition to 4053. Extender clients should try
+both port 53 and 4053"): every app binds 4053 alone, on every platform
+that carries the role (G1); only the sn miner sets
+`DeviceLocalSettings.ProvideExtenderDnsPrivilegedPort` (default off, a
+plain boolean on gomobile and in the c abi settings json) to also try 53,
+and a 53 bind that fails leaves the carrier serving on 4053; connectctl's
+standalone extender binds 53 only under `--dns_privileged_port`. Records carry the list of dns ports that passed the activation probe (`DnsPorts`, the ascending union over the extender's active addresses, with `DnsPort` kept for old readers as the extender's configured port, 4053 by default); each listed port is probed on its own 3 s sub-budget inside the 10 s activation budget, the ports that answer are recorded per address, and a dns carrier with no answering port is left out of the record and
+listed in `refused_carriers`; it does not fail the activation (C2a). A client tries both 53 and 4053 on every extender, whether or not its record lists 53: the ports the record lists first, ascending, then whichever of 4053 and 53 it does not list, 4053 first. So a record that lists 53 is dialed on 53 first, and an app extender's record, which lists 4053 alone, and a manual address no record names yet are dialed on 4053 first with 53 behind it. The ports are one dial, a staggered race (`connect/net_extender_dns_ports.go`): the first port at once, each next port one stagger (250 ms, the stagger of the alt race below) after the last while nothing has answered, or at once when every attempt out has failed; the first port to answer wins and every other attempt is canceled and joined; an answer that refuses or limits the request (A4, A12) ends the race, since the extender answers the same on every port; a port the client's memory budget refused goes again once an attempt that held the budget ends. One dial means one dns dialer per extender, one slot of the strategy's parallel block and expand budget, and one carrier outcome for the directory, so a 53 that never answers on an app extender neither holds the address nor delays its 4053 dial. The feed, the probe and the peer pinger dial the dns carrier the same way. An exact endpoint -- `ExtenderConfigs`, an NLayer hop, the operator's per-port activation probe -- is dialed on the one port it names. Alt is dialed on 53 first,
+then 4053. The extender binds the configured dns port, 4053 in the sdk and
+connectctl, plus 53 under `DnsPrivilegedPort`, and reports what it bound
+so the activator advertises exactly that.
+
+L3. Names. `alt`, `main-alt`, `alt-v4`, `alt-v6`, `main-alt-v4` and
+`main-alt-v6` under bringyour.com and ur.network: static A and AAAA records
+of every proxy host, created once, the family names single-family.
+No `whodis` record is needed: the pump host is only the client's direct
+destination for its pump packets, so it derives from the alt url and the
+old `whodis` record is left for old clients. A client never presents
+an alt name as SNI; it presents the api or connect name, the family form
+included, so alt loads the existing api and connect certificates and no
+certificate is issued for the alt names. The network space derives
+`GetAltUrl`, `GetAltUrlV4` and `GetAltUrlV6` from the platform url by the
+label rule (`connect` to `alt`) with an optional `AltUrl` override, and
+alt names resolve over DoH like the other space names. The rule maps an
+`api` label the same way (`api`, `api-v4` and `api-v6` to `alt`, `alt-v4`
+and `alt-v6`), since alt serves the api names as well (connect#229).
+
+L4. Client strategy. The api gains an "alt h3" dialer (an http3 round
+tripper to the alt addresses with the api name as SNI and the platform's
+verified certificate) and an "alt whodis" dialer (the same over the dns
+translation to 53 then 4053). Priorities: the tcp dialers as today (0 to
+50), alt h3 60, the extender carriers 100, 110 and 120, alt whodis 130,
+weights learning as today. The platform transport's H3, h3dns and
+h3dnspump modes dial the alt url, per family for the pinned provider
+transports, and the pump host derives from the alt url when the pump host
+setting is empty (the sdk clears it); H1 keeps the platform url. An
+explicit port on an alt url pins both udp carriers to it, which is how a
+test fixture is reached; the family group derives `alt-v4` and `alt-v6`
+only from an alt url that is itself derived from the platform url, and
+passes any other alt url through unchanged. The api alt dialers pair the
+same way by the name a request presents: a family name of the alt url's
+own space (`api-v4`, `connect-v6`, with the env prefix) goes to its
+family's alt name on the alt url's port, so an extender activation posted
+to `api-v4` reaches `alt-v4`, whose addresses are v4 alone, even from the
+role's unpinned strategy (connect#229); every other name, and an alt url
+set explicitly, keeps the alt url's host. A family-pinned direct
+strategy carries its family into the udp dials so a v4 activation never
+reaches alt over v6. The 53-then-4053 order is two candidates through the
+existing staggered race. The extender carriers are unchanged, since they forward the
+api and connect over TCP.
+
+L5. Rate limits. Behind the lb nginx enforces the limits and the go
+services enforce none. Alt enforces its own, parsed from `services.yml`'s
+`default_rate_limit` (`requests_per_minute`, `burst`, `net_connections`,
+`exclude_subnets`) through the warp services package, which gains a
+`DefaultRateLimit` field for the top-level anchor: for the api front a
+per-address token bucket with the nginx `nodelay` semantics answering 429,
+and a per-address concurrent request cap; for the connect handler the
+same connection cap and the existing connection rate limit, refusing a
+QUIC connection over the cap with application error 0x1001. Both answer
+429 like nginx, the bucket holds `burst + 1` and is charged before the
+concurrency cap, matching nginx's evaluation order. Excluded subnets are
+exempt. The api service's `route_rate_limits` give exact routes a per-address
+bucket of their own instead of the shared one, as their nginx locations do, and
+such a route still counts against the address's concurrent request cap. Every
+limit keys on the peer of the connection, never on a header, and the api front
+sets its ingress headers (L1) before the limits run.
+
+### M. Statistics and the map
+
+M1. Extender location. At activation the operator already resolves the
+activating address through `GetLocationForIp` for the country code. The
+handler now also passes that location through `model.CreateLocation`,
+exactly as a connection's mmdb path does, and stores `location_id`,
+`city_location_id`, `region_location_id` and `country_location_id` on
+`network_extender` beside `country_code`. City and region are nullable: a
+country-only lookup has neither, and an activation must never fail to
+store for that reason. Each activation of either family rewrites the four
+ids from its own address, so an extender's location is that of the family
+activated last; the two families of one host resolve to the same region
+in practice, and the map counts extenders rather than addresses, so one
+location per extender is the right shape. Rows that predate the columns
+are filled on their next activation, which the 24 hour re-activation
+guarantees within a day.
+
+M2. Definitions. An online extender is a `network_extender` row with
+`active` true and at least one active address row. Its family is
+dualstack when it has active v4 and v6 addresses, else ipv4 or ipv6 for
+the one it has. An online provider is the population
+`CountProvidersByCountry` already counts (active, top-level, connected,
+valid, holding a public provide key); its family is read from the
+reliability row's `ipv4_proven` and `ipv6_proven`: both is dualstack, v6
+alone is ipv6, anything else is ipv4, since rows written before those
+columns existed read as v4-only everywhere else. The family counts of
+either population sum to its total. Gossip carries both families of an
+extender in one record, because the record body lists every active
+address of the extender, and the provider extender role binds dual-stack
+sockets and activates every family the host has a global address for, one
+activation per family api url. A dual-stack host is therefore a dual-stack
+extender without configuration; a host with no global v6 address is ipv4
+only, which is a fact about the host and not a setting.
+
+M3. Contract counts. A gauge is a point in time, so each contract number
+comes in two forms: open now, and created in the trailing 24 hours. The
+collector reads `open` contracts and `dispute AND outcome IS NULL` disputes
+in one bounded statement snapshot. Each set admits at most 1,001 visible
+rows: at most 1,000 is exact, while the sentinel is an explicit lower
+bound. The extender existence probe runs only over the materialized open
+sample, so a rare extender cannot force a complete open-table scan. The open
+sample starts at recent arrivals to avoid old-prefix visibility work; a direct
+small-cap control supports this conservative bound, not a runtime guarantee. An
+extender zero is not exact if the open sample was capped. Acquisition and
+query work have a five-second context budget and a read-only transaction's
+five-second server statement timeout; bounded rollback cleanup may take
+one further second. Visible-row caps do not bound physical visibility work
+through old tuple versions. Timeout/error evidence is unavailable, never
+an exact zero. Explicit model exact-count APIs remain available to callers
+that intentionally need an unbounded count; the collector does not call
+them. The 24 hour counts are bucketized in
+one hour blocks. A bucket is one hour of `create_time`. The counts of a
+complete bucket (contracts, disputed contracts, contracts with an
+extender party) are computed once, by whichever collector host needs them
+first, and cached in redis for 26 hours under the bucket's start time; a
+cold cache is filled by one grouped query over the missing buckets. The
+current partial bucket is counted live on every refresh. A bucket counts
+as complete only once its hour has been over for a minute, so an in-flight
+insert never leaves a short count in the cache; until then it is counted
+live too. The 24 hour value is the sum of the 23 most recent complete
+buckets and the current partial one, so the window is at most 24 hours
+long and never counts a contract twice. A bucket's contract and dispute
+counts come from one range scan of `transfer_contract_create_time` with
+`count(*) FILTER (WHERE dispute)`; its extender count comes from
+`contract_extender`, which gains `create_time timestamp NOT NULL DEFAULT
+now()`, the same transaction time as the contract it belongs to, and an
+index on `(create_time, contract_id)`, so that count is a range scan of
+the small table rather than a probe per contract. A dispute in the window
+is a contract created in the window that is disputed, decided or not; a
+dispute is raised at close and contracts are short-lived, so the creation
+window is the right window.
+Refinement from the implementation: the contract writes its own
+`create_time` with `clock_timestamp()`, not the transaction time, so the
+party rows do not rely on the column default; the insert copies the
+contract's `create_time` from the row written earlier in the same
+transaction, and a test pins the equality on both the escrow and the
+no-escrow paths. The default stays for rows written without a value.
+
+M4. Gauges. The collector exports, on its 5 minute db tick, beside what it
+exports today:
+
+- `urnetwork_stats_online_extenders`
+- `urnetwork_stats_online_extenders_by_country{country_code,country}`,
+  per country exactly as providers are, replaced on each refresh so an
+  emptied country goes stale rather than pushing forever; the country
+  label is the country location's name, or the upper-case code for a row
+  not yet filled by M1
+- `urnetwork_stats_online_providers_by_ip_family{ip_family}` and
+  `urnetwork_stats_online_extenders_by_ip_family{ip_family}`, with
+  `ip_family` one of `ipv4`, `ipv6`, `dualstack`, always all three series
+  so a zero is a zero and never an absence
+- `urnetwork_stats_open_contracts`, `urnetwork_stats_contracts_24h`,
+  `urnetwork_stats_open_contracts_with_extender`,
+  `urnetwork_stats_contracts_with_extender_24h`,
+  `urnetwork_stats_open_disputes`, `urnetwork_stats_disputes_24h`
+- `urnetwork_stats_contract_open_lower_bound{kind}`,
+  `urnetwork_stats_contract_open_status{kind,status}` and
+  `urnetwork_stats_contract_open_observed_at_seconds{kind}` qualify the
+  three open gauges. `kind` is `open`, `with_extender` or `dispute`;
+  status is one-hot `exact`, `capped` or `unavailable`. The legacy open
+  gauges are NaN when not exact; lower bounds are NaN and observation time
+  is zero when unavailable. One collector snapshot emits all fields
+  together. The providers dashboard joins same-process status and source
+  time, accepting at most ten-minute-old observations and thirty seconds
+  of future skew. Current stat panels use instant queries, so a historical
+  last-not-null value cannot conceal missing current evidence. Capped
+  series are labeled "at least"; they cannot establish total size, trend,
+  or extender share. Old publishers without authority metrics remain
+  unknown during a mixed-version rollout. Collector failures before this
+  phase age out through source time even if the old metrics keep pushing.
+
+The provider family counts come from the existing per-country provider
+scan, extended with `count(DISTINCT client_id) FILTER (WHERE ...)` per
+family so the population stays one scan; the extender counts come from
+one scan of the online extenders grouped by country with the same filters.
+The extender and family gauges are public: they join the measurement
+lists of `grafana_test.go`, which admits them to `publicSafeMetrics` and
+requires them on both `public-traffic.json` and the signals row. The six
+contract gauges are internal: a new `internalMeasurementMetrics` list
+requires them on the providers dashboard, and they never enter
+`publicSafeMetrics`.
+Refinement from the implementation: an extender whose activation
+resolved no country (a row written before M1, or a lookup that failed)
+counts in `online_extenders` and in its family series but has no country
+to label, so it is absent from the per-country series; the per-country
+values can therefore sum to less than the total, exactly as a provider
+row without a country is absent from the provider map. The bucket cache
+reads and writes redis through a pipeline rather than a multi-key command,
+since the keys carry no hash tag and span cluster slots.
+
+M5. Public dashboard. `public-traffic.json` gains a row `extender network`
+after the provider network row: a stat and a time series of online
+extenders, a stacked time series of providers by family and one of
+extenders by family, each with a stat per family, a geomap `extenders by
+country` with the same markers layer shape as the provider map in a
+distinct color, and a bar gauge of the top extender countries. Everything
+is read with `max(...)` and no template variable, as the public tests
+require. The per-country extender counts publish nothing the directory
+does not already give away.
+Refinement from the implementation: the public dashboard now carries
+two geomaps, the provider map and the extender map, and the test that
+pinned a single map pins both by panel id and refuses a third; the
+per-family stats select the family beside the metric.
+
+M6. Providers dashboard. `grafana/dashboards/providers.json`, uid
+`urnetwork-providers`, title `urnetwork / providers`, internal (no public
+tag), with the `env` variable from
+`label_values(urnetwork_stats_online_providers, env)` and no block or
+host variable, since every gauge is read with `max(<metric>{env="$env"})`.
+Rows: population (stat and time series of providers and of extenders, a
+stacked family time series and a stat per family for each), contracts
+(open contracts, contracts 24h, open contracts with an extender,
+contracts with an extender 24h, open disputes, disputes 24h, each a stat
+and a time series), derived ratios as stats (the share of open contracts
+with an extender party, the 24 hour dispute rate), and the top 10
+provider and extender countries as time series.
+Refinement from the implementation: the six per-family stat panels
+read `max(<metric>{env="$env",ip_family="..."})`, so the dashboard test
+requires the env matcher first in every selector rather than the exact
+single-matcher literal.
+
+M7. Feed. `stats.json` gains `online_extenders`,
+`online_providers_ipv4`, `online_providers_ipv6`,
+`online_providers_dualstack`, `online_extenders_ipv4`,
+`online_extenders_ipv6` and `online_extenders_dualstack`, each the `max`
+of its gauge with the family label selected, self-omitting when the
+series has no samples like every other field. The site's parser keeps its
+three required fields and reads the new ones as optional: an absent field
+is absent, a present field that is not a non-negative safe integer
+rejects the snapshot. The parsed shape gains `extenders` and the objects
+`providersByFamily` and `extendersByFamily` with `ipv4`, `ipv6` and
+`dualstack`, each key omitted when the feed omits it. The committed SSR
+snapshot carries them once a build fetches a feed that has them.
+
+M8. Map feed. Each region entry of `/stats/providers-map` gains
+`extender_count`, always present. The export runs the provider aggregate
+and a second aggregate of online extenders grouped by their region
+location, merged by country and region; a region with extenders and no
+providers is included with `provider_count` 0. An extender whose location
+has a country but no region is placed under the country location's own
+name at the country centroid, so it is counted and hoverable rather than
+dropped; one with neither is counted in the totals only. The site's hook
+keeps a region when either count is positive and reads a missing
+`extender_count` as 0, so an old blob still renders.
+
+M9. Dot geometry. One pure helper, `src/components/ip/providerDots.js`,
+replaces the function in the page and is imported by it, so the rule is
+testable. Within a country, a region's dot area is linear in its provider
+count between the country's minimum and maximum region counts, mapped
+onto a fixed band of areas: the areas of the current 4 and 9 unit radii,
+so the smallest and largest dots look as they do today; the radius is the
+square root; a country with one region gets the maximum, as today; a
+region with no providers gets the minimum dot. A region with extenders
+also gets a ring: an annulus outside the dot separated by a gap of 2
+units, whose area is linear in the region's extender count between the
+country's minimum and maximum extender counts over its regions with
+extenders, mapped onto a band of 80 to 280 square units in the globe's
+600 unit viewBox; the inner radius is the dot radius plus the gap and the
+outer radius follows from the area. The ring is a stroked circle in the
+dot's color at the annulus' mid radius with the annulus' thickness, drawn
+under its dot, hoverable like the dot, and sorted with the dots by outer
+radius so the largest draw first. The selection ring of the provider
+picker, when a dot is both selectable and ringed, sits outside the
+extender ring; the picker passes no extender counts, so it is unchanged.
+The hover tip lists the country, then `N providers` and `M extenders`,
+both lines always, singular at 1. The landing globe draws no dots and is
+unchanged. The coverage headline reads `N providers and M extenders in C
+countries` when the feed carries an extender count and keeps its current
+sentence otherwise. The legend gains the ring: `ringed by extender count`.
+Refinements from the implementation: both bands are computed over the
+regions that have the population in question, so an extender-only
+region's zero never becomes the provider band's floor, and a country
+whose only region is extender-only draws the minimum dot rather than the
+single-region maximum; a feed field that is present but null or not a
+count rejects the snapshot, only a missing key is absent; the family
+breakdowns are parsed and carried but nothing on the site renders them
+yet; the legend item is capitalized like its siblings.
+
+M10. Tests. Server: model tests for the extender location storage (ids
+present, a country-only row, last activation wins), the extender counts
+by country and family, the provider family counts against rows with each
+proven combination, the contract counts against inserted open, closed,
+disputed and extender-party contracts, the hour bucket cache (a fake
+clock, a cold cache filled by one grouped query, a warm cache counting
+only the partial bucket, a just-ended hour counted live for a minute),
+and the map export merging the two aggregates including a region with
+extenders only; collector tests for the new gauges and the always-three
+family series; grafana tests extended for the new lists, plus a test that
+pins the providers dashboard (every internal metric present, env-scoped,
+replica-safe, no public tag) and the public extender row (the map layer
+shape, `max` reads, no variable). Warp: the feed query and snapshot tests
+extended for every new field including self-omission. Site: node tests
+for the geometry helper (area linearity, the bands, a single region, zero
+providers, ring presence and area, the inner radius, the sort order), the
+map parser (extender-only regions kept, a missing field read as zero) and
+the feed parser (optional fields, rejection of an invalid present field).
+
+### N. Provider extender status and toggle in the apps
+
+N1. Surface. A row named Extender directly under the provide mode row, in
+the Connections card of settings on macOS and in the Provide group of the
+Connect page on Linux and Windows, where each app keeps its provide
+control: a toggle bound to the provider extender setting, a status
+indicator in the provide mode indicator's style, and one line of
+secondary text beneath the setting stating the case (N3). The same row
+without the toggle, rendered once under the provide mode row of the
+provider statistics section (O4) on the earnings screen of macOS, the
+earnings page of Linux and the wallet page of Windows. Hidden on iOS and
+Android, and on any app whose device reports the role unsupported
+(`Supported` false): hidden, never disabled, and `SetProvideExtender` is
+never called while it is hidden, so an app talking to an older daemon
+shows nothing rather than a dead toggle and never writes a setting that
+daemon cannot take. Extenders stay out of the phone builds; G1 stands.
+
+N2. Status source. `ExtenderProvideStatus` gains `Supported`, true only in
+a process built with the role, `State`, `ErrorCase` and `Reason` (N3),
+`StartError` (why a role that was asked for could not start, empty
+otherwise), `TcpUnavailableError` (the tcp 443 bind error while the role
+is off for want of that port and retrying it, G2, empty otherwise) and
+`LastActivationRefused` (true when `LastActivationError` is the operator's
+refusal rather than a request failure). connect's
+`ExtenderFamilyActivationStatus` gains the matching `LastRefused`, set by
+`recordFailure` from the refused branch of the activation call, false
+from every other failure, and cleared with `LastError` on success; the
+sdk copies it beside the newest standing error.
+`GetExtenderProvideStatus`, `AddExtenderProvideStatusChangeListener`,
+`GetProvideExtender` and `SetProvideExtender` join the `Device` interface
+and `DeviceRemote`: the status reads through the rpc with the last value
+cached, a service without the method answering the unsupported status
+and dropping the cache, and no connection answering the last value read
+or pushed, else the unsupported status; the listener is relayed through
+the rpc listener registry, exactly as the client-side extender status of
+K5; the setting reads and writes through the rpc, queued while the device
+process is unreachable and replayed at the next sync exactly as the
+provide mode, the queued or last value read standing meanwhile (on
+before any read), so a toggle never snaps back during a daemon restart;
+a write the device process cannot take (the call answers a missing
+method) is dropped rather than queued, or it would replay on every
+reconnect. On the device the listener is fed by a watch that wakes on
+any change of the setting, the provide state or the role and pushes
+at most one status a second; the watch arms its first wake before
+its goroutine starts, as the network space's extender status watch
+does (sdk 776c19d), since a change landing before the goroutine first
+ran, such as a daemon applying its persisted provide mode right
+after constructing the device, would otherwise go unpushed until the
+next provide or setting change whenever no running role wakes the
+watch. The wire version does not change: a device process without
+the setter also lacks the status method, reports the role unsupported,
+and the row is hidden (N1), so a settable value gated by a read-only
+capability flag shipped in the same version may use the missing-method
+path. A mobile or js build answers the unsupported status locally, as it
+does today; the browser sdk binds none of this, since its device is
+hosted (K8). Bindings regenerate. F3's "on `DeviceLocal` only" is
+superseded by this item.
+
+N3. States. Derived once in the sdk so every app renders one rule, tested
+in this order, the first match winning:
+
+- `off`: the setting is off. Grey; `Off`.
+- `not_providing`: the setting is on but the device is not providing (no
+  provider: provide mode none, the embedder switch off, a hosted device).
+  Grey; `Not providing`.
+- `error`, start: the setting is on and the device is providing, but the
+  role could not start in this space (no network space, no extender
+  directory, no usable identity). A role that never started has no
+  revocation, family or bind to report, and an outcome exists. Red;
+  `Could not start: ` and the reason.
+- `error`, tcp_unavailable: the setting is on and the device is providing,
+  but tcp 443, the one port an extender requires (G2), could not be
+  bound -- another process holds it, such as another provider process of
+  the host, or the host refuses the bind -- so the role is off and tries
+  the port again every 3 minutes. `Enabled` and `Listening` read false and
+  `ListenError` names the tcp carrier. Red; `TCP port 443 is in use by
+  another program. Trying again every few minutes: ` and the reason (the
+  bind error).
+- `error`, revoked: the role runs and the operator revoked the key.
+  Red; `Revoked by the operator`.
+- `active`: at least one family is activated. Green; `Active · IPv4 and
+  IPv6`, or the one family; when the other family's last activation
+  failed, its reason follows on the same line.
+- `error`, listen: no carrier bound, the tcp carrier was lost and is being bound
+  again, or the role failed and is being replaced (G2), when no family reads as
+  activated. Red; `Could not listen: ` and the carrier errors.
+- `error`, activation: the last activation failed or was refused and no
+  family is active. Red; `Activation refused: ` and the operator's reason,
+  or `Activation failed: ` and the error.
+- `setting_up`: the role runs and there is no outcome yet, the carriers
+  binding or the first activation in flight. Yellow; `Setting up`.
+
+During the activator's backoff after a refusal the state stays `error`
+with the reason, since an outcome exists; yellow is only ever the time
+before the first outcome. `Reason` carries the raw error text, and the
+apps prefix the localized case label. `ErrorCase` names the error case
+(`revoked`, `start`, `tcp_unavailable`, `listen`, `activation_failed`,
+`activation_refused`)
+so an app picks its label without re-deriving the rule; it is empty in
+every other state, including `active`, where `Reason` alone carries the
+other family's text and `LastActivationRefused` says whether that text is
+a refusal. A build without the role, a device process without the
+method, and a device out of contact with no last value all report
+`Supported` false and `off`, and the row is hidden (N1); a hosted device
+reports `not_providing`.
+
+N4. Toggle. The existing per-space setting `.provide_extender`, default on
+for desktop and the miner as today, stored independently of the provide
+mode; the role runs only when both allow, and the miner swarm's embedder
+switch still wins. Toggling applies at once, the toggle stays enabled
+while providing is off, and the indicator is then grey with `Not
+providing`. The command line miner keeps printing the status on change.
+The setting is read from its file once per space and cached in
+`LocalState`; every write goes through the same cache, so a write that
+fails on disk still applies for the session and is logged. A hosted
+device ignores the write, in process and over the rpc, as it ignores the
+provide mode. Until the user toggles, the toggle shows the device default
+(F3, G1); on a space with no local state a toggle lasts for the device's
+life.
+
+N5. Strings. Keys for the apple, linux and windows platforms: `extender`
+(the row title), `extender_setting_description` (what turning it on does
+and the ports it uses), `extender_not_providing`, `extender_setting_up`,
+`extender_active` with a `{families}` placeholder filled from the existing
+`ipv4`, `ipv6` and `ipv4_and_ipv6` keys, `extender_revoked`,
+`extender_start_failed`, `extender_listen_failed`, `extender_tcp_unavailable`
+and `extender_activation_failed` with an `{error}` placeholder,
+`extender_activation_refused` with `{error}`; `Off` reuses the existing
+`off` key, and `extender_not_providing` is listed for linux and windows
+only, since the apple catalog is keyed by the English text and already
+carries "Not providing". Generated per platform as every other key.
+
+N6. Tests. Connect: a refusing operator leaves `LastRefused` true with
+its reason, a request error and every other failure leave it false, a
+later success clears both, and the plain api url does the same under
+its placeholder and under the family an answer named. Sdk: a table test
+of the state rule over every case of N3 and their order, with the case
+each error carries; a refusal in the fallback mode marking every family,
+end to end through one api url that activated both (sdk aa47a45); the
+rpc mirror (the status through the rpc and the cached last value, a
+service without the method answering unsupported even after a cached
+value, the setting round trip, the queued setting replayed at sync and
+the last-known value read while unreachable, including a value the sync
+alone seeded, a listener added while unreachable registered and replayed
+at sync, the listener firing on a change with `ErrorCase` and `Reason`
+intact, including a change made before the device's watch first runs);
+the start error over a space with no directory and over an unusable
+identity; the setting cache; the mobile stub answering unsupported;
+bindings. Each desktop app, in its existing view test style: the row
+hidden when unsupported, with no setting read for it; the mapping from
+the sdk's status to the row, tested over the real status fields; every
+state's color and text; the toggle writing the setting through the
+device; the read-only row on the stats screens.
+
+N7. Layout of the extender row. One rule for the three desktop apps, then
+the components of each, so 11b and 12c make no layout choice of their own.
+
+The reading. Every app derives what it draws from `ExtenderProvideStatus`
+and the setting in pure functions with no view behind them, reads only
+`Supported`, `State`, `ErrorCase`, `Reason`, `ActivatedV4`, `ActivatedV6`
+and `LastActivationRefused` from the status, and reads the setting only
+for a status whose `Supported` holds, so a hidden row never reads it:
+`visible` is `Supported`; the dot is grey for `off` and `not_providing`,
+yellow for `setting_up`, green for `active` and red for `error`; the text
+is one string built from the keys of N5, chosen by `State` and, in the
+error state, by `ErrorCase`, so an app never re-derives the rule of N3
+and never names a case the sdk did not pick:
+
+- `off`: `off`.
+- `not_providing`: `extender_not_providing` (apple: the catalog entry
+  "Not providing", which the widget already carries).
+- `setting_up`: `extender_setting_up`.
+- `active`: `extender_active` with `{families}` from `ipv4_and_ipv6` when
+  `ActivatedV4` and `ActivatedV6` both hold, else `ipv4` or `ipv6`. When
+  `Reason` is not empty (the other family's last attempt failed;
+  `ErrorCase` is empty here) the other family's text follows on the same
+  line after " · ": `extender_activation_refused` with `Reason` when
+  `LastActivationRefused` is true, else `extender_activation_failed` with
+  `Reason`.
+- `error`, by `ErrorCase`: `revoked` gives `extender_revoked`; `start`
+  gives `extender_start_failed` with `Reason`; `tcp_unavailable` gives
+  `extender_tcp_unavailable` with `Reason`; `listen` gives
+  `extender_listen_failed` with `Reason`; `activation_refused` gives
+  `extender_activation_refused` with `Reason`; `activation_failed` gives
+  `extender_activation_failed` with `Reason`. A case the app does not know
+  (a newer device process) renders `Reason` bare, in the error color.
+
+`ErrorCase` and `LastActivationRefused` are the fields of N2 that carry
+the refused and failed distinction: a refusal and a failure both land in
+`LastActivationError` as plain text, so without them the two labels of N5
+could not be told apart. `RevokedTime`, `Listening`, `ListenError`,
+`StartError` and `LastActivationError` are not read by the apps; the
+state rule reads them once. Each app tests its mapping from the sdk's
+status over the real status fields: each field it reads moves what it
+draws, and the others change nothing.
+
+The dot is the platform's provide mode indicator without its public ring:
+the same size, the same drawing, one more color. Grey is the theme's muted
+text color; green and red are the provide glyph's own green and coral;
+yellow is the provide glyph's paused yellow of that platform (apple
+`urYellow` #E6EA23, linux and windows `kUrAmber` #F5C242), so the row and
+the provide row above it never show two yellows. The indicator never
+animates: a state change repaints the dot at once, and the toggle's own
+native motion is the only animation in the row.
+
+The state text sits on the line under the title in the platform's note
+style: muted for off, not providing, setting up and active, the error
+color for error. It is one line, cut at the row's width with an ellipsis,
+and the whole text is the row's tooltip, since a listen failure names
+every carrier.
+
+The description, `extender_setting_description`, is a wrapping muted note
+directly under the settings row inside the same group, and is not shown
+with the read-only row.
+
+Toggling writes the setting through the device at once
+(`SetProvideExtender`) behind the app's existing echo guard, and repaints
+the row locally before the listener answers: off gives grey `Off`; on
+gives yellow `Setting up` when the device is providing and grey `Not
+providing` when it is not. The next status from the listener replaces
+that guess. The toggle's position is the setting read through
+`GetProvideExtender` beside every status that reports the
+role supported, which answers the queued or last-known value
+while the device process is out of contact (N2), so the
+toggle never snaps back during a daemon restart; no status arrives
+meanwhile, the guess stands until the sync replays the fresh status, and
+an app that tracks the connection (`GetRemoteConnected`) may grey the dot
+in the meantime, which is not required. The toggle is enabled in every
+state and hidden with the row while `Supported` is false, never merely
+disabled, and while the row is hidden the app neither reads the setting
+nor calls `SetProvideExtender`; the description hides with it.
+
+The read-only row is the settings row with the provide mode row's chevron
+in place of the toggle. It opens the screen where the toggle lives, which
+is the screen the provide mode row beside it opens, and shows no
+description. On the stats screens it sits directly under the provide mode
+row (N1); O8 says where that row is.
+
+Accessibility: the toggle is named "Extender" (`extender`) and carries
+the state text on itself, never on a container that takes no focus: as
+its VoiceOver value on macOS, its accessible description on Linux and its
+help text on Windows. The read-only row is one element announced as a
+button, reading "Extender: <state text>" (on macOS the label "Extender"
+with the state text as its value). The dot is decorative everywhere.
+
+macOS.
+
+- Placement: `SettingsForm-macOS.swift`, the Connections card, directly
+  after the provide mode picker's `HStack` (the `Picker` bound to
+  `deviceManager.provideControlMode`) and before the divider that leads to
+  the kill switch: `Spacer().frame(height: 16)`, `Divider()`,
+  `Spacer().frame(height: 16)`, `ExtenderProvideRow(kind: .setting)`, the
+  four inside `if deviceManager.extenderProvideStatus.supported`, so an
+  unsupported device shows the card exactly as today. `SettingsForm-iOS.swift`
+  is not touched; the iOS stub answers unsupported anyway.
+- Component: `ExtenderProvideRow` (new, `Shared/Views/ExtenderProvideRow.swift`,
+  `#if os(macOS)`), `kind` `.setting` or `.readOnly(action:)`. Layout: a
+  `VStack(alignment: .leading, spacing: 4)`; line one an `HStack(spacing: 8)`
+  of `ExtenderProvideIndicator`, `Text("Extender")` in `bodyFont` and
+  `textColor`, `Spacer()`, then the trailing control; line two the state
+  `Text` in `secondaryBodyFont`, `lineLimit(1)`, `truncationMode(.tail)`,
+  `.help(text)`, padded `.leading` by the indicator's width plus the 8 pt
+  spacing (16 pt in the settings card, 22 pt in the read-only row) so it
+  starts under the title; in the setting kind a third line, the
+  description, `secondaryBodyFont`, `textMutedColor`,
+  `fixedSize(horizontal: false, vertical: true)`, the same leading padding.
+- Toggle: SwiftUI `Toggle(isOn: $deviceManager.provideExtender)` whose
+  label is line one, with `.toggleStyle(.switch)`. An unstyled toggle
+  in this card draws as a leading checkbox, which would put the control
+  before the dot and move the dot off the picker's x, so the switch style
+  is explicit and the switch trails the row as the mockup draws. The
+  kill switch row is not restyled and still draws as a checkbox, so an
+  unsupported device shows the card exactly as today. The macOS form does
+  not use `UrSwitchToggleStyle`.
+- Indicator: `ExtenderProvideIndicator`, `Circle().fill(color)` 8 pt wide,
+  the dot `ProvideModeIndicator` draws. In the settings card it stands
+  bare like the picker's own 8 pt `Circle()`, so both titles start on one
+  x; in the read-only row it sits in a 14 pt frame like `ProvideModeIndicator`
+  inside `ProvideModeRow`. Colors: grey `themeManager.currentTheme.textMutedColor`,
+  green `.urGreen` (#87FB67), yellow `.urYellow` (#E6EA23), red `.urCoral`
+  (#FF6C58), the asset symbols the provide indicator uses.
+- State line colors: `textMutedColor`, and `themeManager.currentTheme.dangerColor`
+  (the `UrCoral` asset) for error.
+- Strings, by English literal through the catalog, all present since 11a:
+  "Extender", "Off", "Not providing", "Setting up", "Active · %@" with
+  "IPv4 and IPv6", "IPv4", "IPv6", "Revoked by the operator",
+  "Could not start: %@", "Could not listen: %@", "Activation refused: %@",
+  "Activation failed: %@", and the description sentence;
+  `String(localized:)` with `%@` filled by `String(format:)`.
+- Source: `DeviceManager` gains
+  `@Published private(set) var extenderProvideStatus: ExtenderProvideStatusModel`
+  (`.unsupported` until a device reports) and
+  `@Published var provideExtender: Bool`, both fed through
+  `ExtenderProvideSource`, a protocol in `DeviceManager.swift` in
+  the shape of `DeviceAuthCallbackSource` (read the status, read the
+  setting, write the setting, observe the status) that `SdkDeviceRemote`
+  conforms to and a test replaces. `setupExtenderProvide(source:)`,
+  called beside the provide listeners, registers the status listener
+  and then seeds from `readExtenderProvideStatus()`; the seed and every
+  pushed status go through `applyExtenderProvideStatus(_:from:)`, a
+  pushed one on the main queue through the initializer's injectable
+  `extenderProvideCallbackDispatch`, and one still queued from a
+  replaced source is dropped by an `ExtenderProvideCallbackOwner` token.
+  `resetExtenderProvide()`, called when the device's listeners are
+  cleaned up, closes the listener and restores `.unsupported` with the
+  setting on, without writing. `provideExtender`'s `didSet` writes
+  through the source under `DeviceSettingWritePolicy.shouldPropagate`,
+  as `provideControlMode` does, and only while the status is supported
+  and a source is set; `applyExtenderProvideStatus(_:from:)` reads the
+  setting from the source only for a supported status and applies it
+  under the echo guard, and a status that is not supported leaves the
+  switch as it is. The model and the reading are
+  `ExtenderProvideStatusModel` (`supported`, `state`, `errorCase`,
+  `reason`, `activatedV4`, `activatedV6`, `lastActivationRefused` and
+  `enabled`, the last being what O8 reads) and `ExtenderProvideDisplay`
+  in `Shared/ViewModels/ExtenderProvideModel.swift`, plain values in the
+  shape of `ExtenderStatusModel`; `ExtenderProvideDisplay.of(status:)`
+  returns the dot color case (`ExtenderProvideDot`), the text and
+  `visible`, and `ExtenderProvideDisplay.guess(on:providing:)` the
+  toggle's local repaint, which `DeviceManager.extenderProvideGuess`
+  holds for both rows, the settings row and the earnings row, until the
+  next status or the reset clears it; both rows draw
+  `DeviceManager.extenderProvideDisplay`, the guess while it stands,
+  else the reading of the status.
+- Accessibility: the `Toggle` label names the control "Extender";
+  `.accessibilityValue(Text(stateText))` on the toggle, which
+  keeps the switch's on and off value and gives VoiceOver
+  the state text as that value's description; the indicator
+  `.accessibilityHidden(true)`. The read-only row is a `Button` with
+  `.buttonStyle(.plain)`, `.accessibilityElement(children: .ignore)`,
+  `.accessibilityLabel("Extender")`, `.accessibilityValue(stateText)` and
+  `.accessibilityAddTraits(.isButton)`: on macOS the element modifier
+  alone rebuilds the element without the button's role, so VoiceOver
+  would not say the row opens anything and its buttons rotor would skip
+  it, and the trait puts the role back.
+- Read-only row: `ProviderStatsSection.swift`, directly under
+  `ProvideModeRow(action: { navigate(.settings) })`: `Spacer().frame(height: 8)`
+  then `ExtenderProvideRow(kind: .readOnly(action: { navigate(.settings) }))`,
+  inside `if deviceManager.extenderProvideStatus.supported`, itself inside
+  `#if os(macOS)` since the row is compiled for macOS only. Line one ends
+  in `ProvideModeRow`'s `chevron.right` (12 pt medium, `textFaintColor`).
+  The earnings screen is the only macOS screen that repeats the provide
+  mode row.
+
+Linux.
+
+- Placement: `ConnectPage::BuildPaneA`, the Provide group of
+  `moreOptionsHost_`, after `discoverableText_` (the provide control's own
+  footer line) and before the Connect options header, so the segmented
+  control keeps its footer. Neither `SettingsPage` nor the account pane
+  hosts the provide control, and the legacy column of `MainWindow::BuildHome`
+  ("connect-legacy") gets nothing.
+- Component: hand built like the provide row above it, since the `kit::`
+  two-line rows have no leading slot. `extenderRow_` is `kit::MakePaneRow(44)`
+  whose inner box (`RowInner`) holds a `Gtk::Box(HORIZONTAL, 8)` of the dot
+  label, a `Gtk::Box(VERTICAL, 1)` (hexpand, valign CENTER) with the title
+  `Gtk::Label` (`ur-row-title`, xalign 0) and the state `Gtk::Label`
+  (`ur-row-note`, xalign 0, `set_single_line_mode(true)`,
+  `set_ellipsize(Pango::EllipsizeMode::END)`, `set_tooltip_text(text)`),
+  and a `Gtk::Switch` (valign CENTER). Under it `extenderDescription_`, a
+  `Gtk::Label` built exactly as `discoverableText_` (`ur-caption`, xalign
+  0, margins 12 start and end, 8 bottom, wrap, `CapNatural(…, 32)`) with
+  `extender_setting_description`. Both `set_visible(false)` while the
+  status is absent or unsupported.
+- Toggle: the `Gtk::Switch` of `addToggleRow` in the same group, wired the
+  same way: `kit::SetAccessibleLabel(*toggle, T_("extender", "Extender"))`,
+  `property_active().signal_changed()` guarded by `updatingControls_`,
+  calling `host_.SetProvideExtender(on)`.
+- Indicator: a `Gtk::Label` with `set_markup("<span foreground='…'>●</span>")`,
+  always the solid "●", `kit::MarkDecorative`, as `provideDot_` beside it.
+  Colors through `HexForMarkup`: grey `kUrTextMuted` (#989898), green
+  `kUrGreen`, yellow `kUrAmber` (#F5C242), red `kUrCoral`, picked by
+  `ExtenderDotColor`. Both rows paint through
+  `PaintExtenderProvideRow(dot, state, row)` in `ExtenderProvideRowPaint.hpp`
+  (new, the GTK side the two pages share), which sets the dot, the state
+  text, its tooltip and the error class and returns the text; each page
+  keeps only its own part, the switch and the description on the connect
+  page and the button's accessible label on the earnings page.
+- State line colors: `ur-row-note` (11 px, #989898) as built; the
+  error state adds `ur-error-text` and removes it on the way back, and
+  `UrTheme.cpp` gains `.ur-row-note.ur-error-text { color: #FF6C58; }`,
+  since the two classes have equal specificity and `.ur-row-note`, later
+  in the sheet, would keep the line grey; the two-class rule keeps the
+  note's 11 px size.
+- Strings: `T_("extender", "Extender")` and
+  `T_("extender_setting_description", …)` where the widgets are built;
+  the state line's keys and English sources ride the `ProvideRow` of the
+  reading below (`off` "Off", `extender_not_providing` "Not providing",
+  `extender_setting_up` "Setting up", `extender_active` "Active · {}"
+  with `ipv4_and_ipv6` "IPv4 and IPv6", `ipv4` "IPv4" or `ipv6` "IPv6",
+  `extender_revoked` "Revoked by the operator", and, filled with the
+  reason, `extender_start_failed` "Could not start: {}",
+  `extender_listen_failed` "Could not listen: {}",
+  `extender_activation_refused` "Activation refused: {}" and
+  `extender_activation_failed` "Activation failed: {}"), looked up
+  through `T_` and filled through `Format` by `ExtenderStateText` in
+  `ExtenderProvideRowPaint.hpp`; every English source matches the
+  store's `en` byte for byte, as `I18n.hpp` requires.
+- Source: `SdkHost` gains `GetExtenderProvideStatus()`
+  (`std::optional<urnet::ExtenderProvideStatus>`, nullopt with no device,
+  the shape of `GetExtenderStatus`), `GetProvideExtender()`,
+  `SetProvideExtender(bool)`, and `DrawerEvent::ExtenderProvideStatus`,
+  emitted from `device_->addExtenderProvideStatusChangeListener` subscribed
+  beside the extender status listener in `SubscribeDrawer`.
+  The reading is in `ExtenderProvidePresentation.hpp` (new,
+  header-only and SDK-free like `ExtenderStatusPresentation.hpp`).
+  `extender::ProvideRowFor(haveStatus, supported, state, errorCase,
+  reason, activatedV4, activatedV6, refused, provideExtender)`
+  returns `ProvideRow{visible, dot (Grey, Green, Yellow, Red),
+  textKey, textEnglish, argument, familiesKey, familiesEnglish,
+  detailKey, detailEnglish, detailArgument, errorText, on}` with
+  equality: the families fill the active line's `{}`, and the detail
+  is the other family's refusal or failure after " · ", which a bare
+  `{textKey, argument}` could not carry without the widget re-deriving
+  which key follows. `StateTextFor(row, lookup, format)` composes the
+  one line, and `ProvideRowGuess(on, providing)` is the toggle's local
+  repaint. `ProvideRowOf(status, readSetting)`, generic over the status
+  type, holds the one call into `ProvideRowFor`: it takes the optional
+  status as the widgets hold it and calls the setting reader only for a
+  supported status, so a hidden row reads no setting; the connect page
+  passes `GetProvideExtender()`, and the earnings page, which has no
+  switch, a reader answering false. The widget only draws the row, and
+  drops a push that changes nothing.
+- Accessibility: the switch's label as above, and the switch itself gets
+  `update_property(Gtk::Accessible::Property::DESCRIPTION, stateText)` on
+  every repaint, not the row box, which has the generic role and never
+  takes focus; the dot is decorative.
+- Read-only row: `EarningsPage::BuildNetworkPane`, directly under
+  `provideModeRow_`, which O8 moves into the Provider statistics group; the
+  extender row moves with it. `extenderRow_` is a flat `Gtk::Button` built
+  as `provideModeRow_` is (`flat`, no frame, margin bottom 8) whose child is
+  the same dot plus two-line text box, ending in the `go-next-symbolic`
+  image (`dim-label`) instead of the switch; clicking runs
+  `on_open_provide_settings`, the connect page. Its accessible label is
+  `T_("extender", "Extender") + ": " + stateText`, the way `ExtenderPanel`
+  composes its own. Repainted by `EarningsPage::ApplyExtenderProvideState`
+  on the new drawer event, which `MainWindow` forwards to the earnings page
+  in the handler that already forwards every event to `connectPage_`.
+
+Windows.
+
+- Placement: `MainWindow.xaml`, `ConnectPaneA`, the provide group, after
+  `ProvideStatsRow` (the group's last row) and before the connect options
+  header. `SettingsPage` and `SettingsSheets` host no provide control.
+- Markup: `ExtenderRow`, a `Border` on `UrPaneRowStyle`, `MinHeight="44"`,
+  `Visibility="Collapsed"`, holding a `Grid` with `ColumnSpacing="8"` and
+  columns Auto, *, Auto: a 12 by 12 `Grid` with `Ellipse x:Name="ExtenderDot"`
+  7 by 7 and no ring (the `ProvideModeDot` cell), a `StackPanel`
+  (`VerticalAlignment="Center"`, `Spacing="1"`) of
+  `TextBlock x:Name="ExtenderLabel"` on `UrRowTitleStyle` and
+  `TextBlock x:Name="ExtenderNote"` on `UrRowNoteStyle`, and
+  `ToggleSwitch x:Name="ExtenderToggle"` on `UrSwitchToggleStyle`,
+  `Width="44"`, `Toggled="OnExtenderToggled"`, the `FixedIpToggle` row's
+  shape. Under it `ExtenderDescriptionRow`, a `Border` on `UrPaneRowStyle`
+  with `MinHeight="0"` and `Padding="12,8"` around
+  `TextBlock x:Name="ExtenderDescription"` on `UrRowNoteStyle` with
+  `TextWrapping="Wrap"` and `TextTrimming="None"`, `Visibility="Collapsed"`.
+  `ConnectPage::ApplyStrings` sets the label and the description.
+- Toggle: `OnExtenderToggled`, declared on `MainWindow` beside
+  `OnProvideModeChanged` and forwarded to `ConnectPage::OnExtenderToggled`
+  as that one is, guarded by `updatingControls_`, calling
+  `Sdk().SetProvideExtender(w_.ExtenderToggle().IsOn())`.
+- Indicator: `ExtenderDot.Fill(colors::MakeBrush(ExtenderProvideToneColor(tone)))`,
+  the `ProvideModeDot` drawing; colors `colors::kTextMuted` (#989898),
+  `colors::kUrGreen`, `colors::kUrAmber` (#F5C242), `colors::kUrCoral`.
+  `ExtenderProvideToneColor`, `ExtenderProvideNoteBrush` and
+  `ExtenderProvideText` live in `ProvideModeVisual.h` beside the provide
+  mode visual, so the Connect page's row and the wallet page's row paint
+  one way.
+- State line: `ExtenderNote` keeps the muted brush of `UrRowNoteStyle` and
+  takes `Foreground` from `ExtenderProvideNoteBrush(tone)`:
+  `UrErrorTextBrush` (#FF6C58) from the app dictionary in the error
+  state, `colors::MutedBrush()` otherwise; trimmed by the style, and
+  `ToolTipService::SetToolTip(note, box_value(text))`.
+- Strings: `Loc("extender")` and `Loc("extender_setting_description")` in
+  `ConnectPage::ApplyStrings`; the state line is
+  `ExtenderProvideText(model)`, which fills `ComposeExtenderProvideText`
+  with `Localized(key)`, `Format(key, argument)` and the reason widened
+  from UTF-8, over the keys `off`, `extender_not_providing`,
+  `extender_setting_up`, `extender_active` with `ipv4_and_ipv6`, `ipv4`
+  or `ipv6`, `extender_revoked`, `extender_start_failed`,
+  `extender_listen_failed`, `extender_activation_refused` and
+  `extender_activation_failed`; every key is in
+  `Strings/en/Resources.resw` since 11a, with the placeholder lowered to
+  `{}`.
+- Source: `ExtenderProvideStatusView` (`supported, state,
+  errorCase, reason, activatedV4, activatedV6, refused, enabled,
+  provideExtender`, with equality; `enabled` is what O8 reads) lives
+  in `ExtenderPresentation.h`, which `SdkHost.h` includes, so the host
+  tests reach it, and `ExtenderProvideStatusViewOf(status, readSetting)`,
+  generic over the status type, maps the sdk's optional status
+  to it and calls the setting reader only for a supported status, so a
+  device that reports the role unsupported is never asked for the
+  setting; the host's reader is the device's `getProvideExtender()`
+  while the service's control pipe is connected, else the setting last
+  published, since with the pipe down the getter would be an rpc into a
+  dying service. `SdkHost` gains
+  `SetExtenderProvideStatusHandler`, `PublishExtenderProvideStatus`
+  (the view from `ExtenderProvideStatusViewOf`, dedup by
+  value, the shape of `PublishExtenderStatus`, subscribed
+  beside it), `CurrentExtenderProvideStatus()` and
+  `SetProvideExtender(bool)`, which sets `extenderProvideRepublish_` so
+  the next status publishes even when it equals the last, and two flips
+  inside one device epoch cannot leave the toggle's guess standing.
+  `MainWindow` hands each
+  view to `connect().ApplyExtenderProvideState(view)` and
+  `wallet().ApplyExtenderProvideState(view)` on the UI queue,
+  as `OnStatsChanged` hands `LiveStats` to both. The reading is
+  `ExtenderProvideRowModelFor(view)` in `ExtenderPresentation.h`
+  (`ExtenderProvideRowModel{visible, tone (Grey, Green, Yellow, Red),
+  textKey, argument, argumentKind, suffixKey, suffixArgument, on}`,
+  the suffix being the other family's refusal or failure on the active
+  line), composed into the one line by `ComposeExtenderProvideText`, with
+  `ExtenderProvideGuessFor` for the toggle's local repaint; all pure and
+  covered by `tools/extender-tests.cpp`.
+- Accessibility: `AutomationProperties::SetName(toggle, Loc("extender"))`,
+  `AutomationProperties::SetHelpText(toggle, stateText)`; the dot is
+  `IsHitTestVisible(false)` with `AccessibilityView` Raw.
+- Read-only row: `WalletPaneC`, directly under the `WalletProvideModeButton`
+  border, which O8 moves: `WalletExtenderRow`, a `Border` on `UrPaneRowStyle`
+  `MinHeight="44"` with `Button x:Name="WalletExtenderButton"` in the
+  transparent style of `WalletProvideModeButton`, `Click="OnWalletExtender"`
+  (declared on `MainWindow` beside `OnWalletProvideMode` and navigating to
+  the connect page exactly as that one does). Its
+  `Grid` has the 12 by 12 dot cell (`WalletExtenderDot`), the two-line text
+  (`WalletExtenderLabel` on `UrKeyTextStyle`, the provide mode row's label
+  style, and `WalletExtenderNote` on `UrRowNoteStyle`) and the `&#xE76C;`
+  `FontIcon` on `UrRowIconStyle` with `FontSize="12"`.
+  `AutomationProperties::SetName(button, Loc("extender") + L": " + stateText)`.
+
+Mockups. The dot's color is written at the right; `(o)` is a switch off,
+`(•)` on, `☐` a checkbox; a state text longer than the row is cut with
+`…` and carried by the tooltip.
+
+```
+macOS, Settings > Connections card (bodyFont 14, secondaryBodyFont 12)
+
+ ● Provide mode                                     [ Auto     ▾ ]
+ ────────────────────────────────────────────────────────────────
+ ● Extender                                                  (o)   grey
+   Off
+   While you are providing, this device also relays for people
+   whose access to the network is blocked, on TCP and UDP 443
+   and UDP 4053.
+ ────────────────────────────────────────────────────────────────
+ ● Extender                                                  (•)   yellow
+   Setting up
+   While you are providing, …
+ ────────────────────────────────────────────────────────────────
+ ● Extender                                                  (•)   green
+   Active · IPv4 and IPv6
+   While you are providing, …
+ ────────────────────────────────────────────────────────────────
+ ● Extender                                                  (•)   red
+   Could not listen: tcp 443: bind: permission denied; udp 443…   coral text
+   While you are providing, …
+ ────────────────────────────────────────────────────────────────
+ ☐ Kill switch ⓘ
+
+ (grey with the switch on reads "Not providing")
+```
+
+```
+linux, Connect page, pane A, Provide group (ur-row-title 13, ur-row-note 11)
+
+ PROVIDE
+   ●  [ Auto | Always | Network | Never ]
+   Enable provide mode to make this device discoverable
+   ● Extender                                            [ o ]  grey
+     Off
+   While you are providing, this device also relays for people
+   whose access to the network is blocked, on TCP and UDP 443 and
+   UDP 4053.
+ CONNECT OPTIONS
+
+   ● Extender                                            [ • ]  yellow
+     Setting up
+   ● Extender                                            [ • ]  green
+     Active · IPv4 · Activation failed: dial tcp6 [2001:db8::1]…
+   ● Extender                                            [ • ]  red
+     Activation refused: the operator refused the activation      ur-error-text
+```
+
+```
+windows, Home, ConnectPaneA, provide group (UrRowTitleStyle 13, UrRowNoteStyle 11)
+
+ ● PROVIDE MODE
+   [ Auto | Always | Network | Never ]
+ ⌕ Enable provide mode to make this device discoverable
+   ● Extender                                            ( o )  grey
+     Off
+   While you are providing, this device also relays for people
+   whose access to the network is blocked, on TCP and UDP 443 and
+   UDP 4053.
+ CONNECT OPTIONS
+
+   ● Extender                                            ( • )  yellow
+     Setting up
+   ● Extender                                            ( • )  green
+     Active · IPv4 and IPv6
+   ● Extender                                            ( • )  red
+     Revoked by the operator                                    UrErrorTextBrush
+```
+
+Checklist and tests.
+
+- apple (`app/network`): new `Shared/ViewModels/ExtenderProvideModel.swift`,
+  new `Shared/Views/ExtenderProvideRow.swift`; change
+  `Shared/ViewModels/DeviceManager.swift` (the status, the
+  setting, the listener, the reset, `ExtenderProvideSource`),
+  `Main/Account/Settings/SettingsForm-macOS.swift`,
+  `Main/Account/Earnings/ProviderStatsSection.swift`. Tests: new
+  `networkTests/ExtenderProvideRowTests.swift` in the style of
+  `ExtenderPanelTests.swift` (Swift Testing, `@Test`, `#expect`, values
+  not views): unsupported is hidden; every N3 case gives its color case
+  and its text, each error case by `ErrorCase` alone; the three family
+  texts; the active line with the other family's refusal and with its
+  failure; an unknown error case renders the reason bare; the
+  toggle guess for on while providing, on while not, and off;
+  the model read from the sdk's status, field by field. New
+  `networkTests/ExtenderProvideSettingTests.swift` tests `DeviceManager`
+  against a recording `ExtenderProvideSource` with a held dispatch: a
+  toggle writes the setting through the source at once and repaints with
+  the guess, and the seed writes nothing; while the role is unsupported
+  nothing is written, no guess is set and no setting is read; the
+  setting is read once for each supported status, seeded or pushed, and
+  never for an unsupported one, which leaves the switch as it is; a pushed
+  status replaces the guess and moves the switch without writing it back;
+  a status queued from a replaced source changes nothing; the reset hides
+  the row without writing.
+- linux (`app`): new `src/ExtenderProvidePresentation.hpp`, new
+  `src/ExtenderProvideRowPaint.hpp`, new
+  `tests/ExtenderProvidePresentationTest.cpp` added to the test source
+  list in `meson.build`; change `src/SdkHost.hpp`, `src/SdkHost.cpp`,
+  `src/ConnectPage.hpp`, `src/ConnectPage.cpp`, `src/EarningsPage.hpp`,
+  `src/EarningsPage.cpp`, `src/MainWindow.cpp`, `src/UrTheme.cpp`, and
+  `src/ConnectDrawer.cpp`, whose switch over `DrawerEvent` takes the new
+  event as a no-op under `-Werror=switch`. The test file pins the same
+  cases as apple's through `ProvideRowFor` and `StateTextFor`, in the
+  style of `ExtenderStatusPresentationTest.cpp` (`UR_TEST`,
+  `UR_EXPECT_TRUE`), every key and English source the row can emit
+  against `po/en.po`, and `ProvideRowOf` over a status struct
+  carrying every field of `urnet::ExtenderProvideStatus` under the sdk's
+  names: the eleven fields the row does not read change nothing when set
+  to noise, each field it reads moves the row on its own, and a hidden
+  row, with no status or an unsupported one, never calls the setting
+  reader.
+- windows (`app`): change `src/App/ExtenderPresentation.h`,
+  `src/App/ExtenderPresentation.cpp`, `src/App/ProvideModeVisual.h`,
+  `src/App/SdkHost.h`, `src/App/SdkHost.cpp`, `src/App/MainWindow.xaml`,
+  `src/App/MainWindow.xaml.h`, `src/App/MainWindow.xaml.cpp`,
+  `src/App/ConnectPage.h`, `src/App/ConnectPage.cpp`,
+  `src/App/WalletPage.h`, `src/App/WalletPage.cpp`; the same cases
+  through `ExtenderProvideRowModelFor` and `ComposeExtenderProvideText`
+  in `tools/extender-tests.cpp`, the English composed from
+  `Strings/en/Resources.resw` as the app ships it, with a case that the
+  store carries every key the row names and one `{}` in each key that
+  takes an argument, built with the command in that file's header,
+  which is the only test the windows tree can run on the build host,
+  and `ExtenderProvideStatusViewOf` over a status struct carrying
+  every field of `urnet::ExtenderProvideStatus` under the sdk's names:
+  the ten fields the view does not read change nothing, each field it
+  reads, `Enabled` among them, changes the view on its own, and a hidden
+  row, with no status or an unsupported one, never calls the setting
+  reader.
+
+### O. Extender statistics series
+
+O1. Counters. The extender server keeps cumulative counters of the
+traffic it relays, summed over every carrier: bytes and reads in each
+direction, operator-centric. Ingress is what moves toward the operator
+(from a client into the network) and egress is what moves back toward
+the client. A read is one chunk the relay moved, counted at the relay
+copy on either side, because a byte stream has no packet boundary in
+userspace; the extender chart is therefore labeled reads per second
+where the provider chart says packets. The decoy reverse proxy and the
+DNS forwarder that answer probers are not extender traffic and are not
+counted. `ExtenderServer.Stats()` returns `ExtenderStats` with
+`IngressByteCount`, `IngressReadCount`, `EgressByteCount` and
+`EgressReadCount`, cumulative for the life of the server like the packet
+stats of a device. Each start of the role builds a new server, so the
+counters restart from zero whenever the role restarts (the setting or
+provide toggled off and on), which the series of O3 absorbs.
+
+O2. Device surface. `Device.GetExtenderStats() *ExtenderStats` (the sdk
+type mirrors O1's four fields) on `DeviceLocal` reads the running role's
+server and is nil whenever the role is not running: every case of N3's
+`off` and `not_providing` (unsupported, the setting off, provide mode
+none, the embedder switch off, a hosted device), a role that could not
+start, and a closed device. Nil is the same fact as the status's
+`Enabled` false, and the two never disagree, since both read the
+installed role. `DeviceRemote` reads it through the rpc as
+`GetProviderPacketStats`, with no cache and nil while the service is
+unreachable, except that a service without the method keeps its session
+and answers nil, as the status read of N2 does: the row and the section
+are hidden against such a device, and losing rpc control of the tunnel
+over a chart would be the wrong trade. The read is one more small rpc
+per throughput tick on every remote device, including those that never
+run the role, as the provider stats read already is; accepted. Bindings
+regenerate, cgo and gomobile; the browser sdk binds none of this, as for
+N2.
+
+O3. Series. `ContractViewController` gains an extender series sampled
+beside the provider series on the same one second tick, with the same
+hold and gap rules, exposed as `GetExtenderThroughputPoints()` and
+notified through the existing throughput listener, with the latest
+sampled stats beside it as `GetExtenderStats()`, the mirror of
+`GetProviderPacketStats()` on the controller. Its points carry the
+extender sample in the `Remote` route only, egress and ingress as O1
+defines them (the sample's egress fields are the bytes and reads moving
+back toward clients, its ingress fields the bytes and reads moving toward
+the operator), the reads riding in the packet count fields of
+`ThroughputSample` and the bit rates computed from the bytes as for every
+other series; `Local` and `Block` are empty samples, and no provider
+mirror is applied. The series has no points until the device first
+reports extender stats, and its first point lands one tick after that,
+since the first sample only sets the base. Once the role stops and the
+device reports nil, the series is held, not emptied: one zero point per
+tick, the old points aging out of the window, as the provider series
+holds at zero when providing stops. A restarted role reports counters
+from zero, which the series takes as a gap (a zero point and a rebase,
+deltas resuming the next tick), and a restart within one interval clamps
+its negative deltas to zero. The section's presence is therefore never
+read from the points (O4). The throughput listener is notified on every
+tick while any series has an active point in its window, and once when
+a series goes quiet or starts. Every series is evaluated whenever
+any series appends, so another series can spend a series' one idle
+notification before its own stats exist; a series whose stats appear
+or vanish re-arms it, so the change notifies once even inside an idle
+window, and the idle ticks after it stay silent (sdk e035c92).
+
+O4. App sections. An Extender statistics section directly above the
+provider statistics section, on every screen that shows the provider
+one, visible only while the provider statistics are visible and the role
+is running; hidden otherwise, with no placeholder, since the row of N1
+already explains the state. The role is running while
+`ExtenderProvideStatus.Enabled` holds, which the apps already receive
+through the status listener of N2 within a second of a change, and which
+is `GetExtenderStats() != nil` on the device (the controller's
+`GetExtenderStats()` of O3 is the same fact one tick late, for a consumer
+with no status listener); the points outlive the role, held
+at zero (O3), so the section's visibility follows the pushed
+status and never the throughput tick or the point count.
+Contents: the title and the transfer chart of the extender series over
+the `Remote` route with the title Extender, the same 60 second window as
+the provider chart, bytes per second and reads per second. The read-only
+extender row of N1 is rendered once per screen, directly under the
+provide mode row inside the provider section, so it stays on screen
+while the role is off or not providing, which is when its text matters.
+On macOS that screen is the earnings screen, where the provider section
+lives; Android has no role and gets nothing.
+
+O5. Linux and Windows catch-up. Neither app has a provider statistics
+section, so this phase brings the macOS one to both, with the extender
+section above it: the title, the existing provide mode glyph row moved
+into the section, the read-only extender row under it (O4), the Local
+chart of the provider series, the provider transport distribution bar
+opening the provider transport settings (the client bar and the sdk
+distribution math already exist on both), the Blocked chart at half
+height, and `providing_disabled` as the section header's meta label
+while the provider statistics are not visible, the reliability group's
+mechanism, with the chart rows collapsed; placed on the earnings page on
+Linux and the wallet page on Windows where the provide mode row already
+is. The sdk hosts of both read the provider and the extender point lists
+on the throughput listener as they read the client list today, and the
+running state of the role from the status of N2. The provider section's
+header is static on both: neither app has a provider contracts screen
+fed by provider data (their contract sheets accept the provider mode but
+read the client feed), so the tap-through macOS has is deferred to a
+provider contracts feed on both.
+
+O6. Strings. `extender_statistics` (the section title), `reads_per_second`
+for the chart unit, and, where Linux and Windows lack them, the strings
+of the provider section: `provider_statistics` and `providing_disabled`,
+and on Windows the chart titles `local` and `blocked`, whose keys now
+list those platforms (both trees already carried the strings); platforms
+apple, linux and windows as N5.
+
+O7. Tests. Connect: the counters over a relayed session on each carrier,
+both directions, bytes and reads, with the decoy proxy and the DNS
+forwarder proven not to count. Sdk: `GetExtenderStats` nil
+while the role is not running (off, not providing, a role
+that could not start, hosted, closed) and live while it
+is, equal to the server's own counters after a relayed session and zero
+again after a restart; the rpc mirror, including the missing method
+keeping the session and the unreachable device answering nil with
+nothing cached; the extender series sampling (deltas in the `Remote`
+route with empty `Local` and `Block`, holds, the series held at zero
+after the stats go nil, the gap and the clamp on a restart, the first
+point one tick after the first stats) in the existing series test style,
+and the poll loop against a device whose stats come and go; a series
+notifying once when its stats appear or vanish after another series spent
+its idle notification; bindings. Apps: the section's visibility rule
+as a pure function over every combination, in each app's test style,
+with the expected rows written out rather than computed from the rule's
+own expressions, and on Linux and Windows the provider section's own
+visibility in the same table; the chart binding where an app's tests
+reach views as values (apple, through the section's chart factory), while
+on Linux and Windows, whose tests are pure presentation code with no
+widget behind them, the chart bindings are reviewed.
+
+O8. Layout of the statistics sections. The extender section of O4 and,
+on Linux and Windows, the provider section of O5 it sits above, mapped
+onto the components each app already has.
+
+The rule. On every screen the provider statistics are visible while the
+provide control mode is not never and the device reports provider packet
+stats, the gate `ProviderStatsSection` already applies on macOS
+(`deviceManager.provideControlMode != .Never && throughputStore.hasProviderStats`);
+otherwise the provider section shows its title, the provide mode row,
+the extender row and the `providing_disabled` line, and nothing else.
+Whether the device reports provider packet stats is read from the view
+controller on the throughput tick, except right after a controller
+opens, which an app does whenever its window is shown or a device
+arrives: a new controller reports no provider stats until its first
+sample and notifies only after its second, so reading it then would
+collapse the provider and extender statistics under `providing_disabled`
+for about two seconds on a device that is providing. At those moments
+the app asks the device whether `GetProviderPacketStats()` answers
+stats, one rpc, never on a UI thread where the app forbids rpcs; the
+ticks after it read the controller, which has sampled by then, and
+a later change of that presence reaches a tick (O3). No hold timer
+stands in for the read, since a timer cannot tell a device that
+stopped providing from a controller that has not sampled yet. The
+extender section is visible while the provider statistics are visible and
+the role is running, the `enabled` of the status model the row of N7
+already keeps (O4), which changes on the pushed status and not on the
+throughput tick; hidden otherwise with no placeholder, its separator
+hidden with it. The points are read on the throughput tick as the
+provider points are, and a chart with no points yet draws empty for the
+tick or two before the first one lands. Its contents are the title
+(`extender_statistics`) and the transfer chart of the extender series;
+the extender row of N1 is rendered once per screen, directly under the
+provide mode row inside the provider section as O4 places it, so it stays
+on screen while the role is off or not providing, which is when its text
+matters. Neither section on any platform is a tap target for extender
+contracts, since there are none.
+
+The chart. `TransferChart` over the extender series in the `Remote` route,
+title `extender` ("Extender"), the view controller's window (60 s), the
+full chart height of the provider Local chart on that platform, bytes in
+`urLightBlue` (#D6E6F4, the H1 transport token) and reads in `urPink`
+(#ED8FFF, the count series color of the Remote and Local charts), which
+keeps it in the chart family while nothing else draws a pale blue byte
+series beside a green one. The chart is mirrored around its axis with
+egress above and ingress below, so the top half and its ▲ label are the
+bytes and reads moving back toward clients (egress, O1) and the bottom
+half and its ▼ label are the bytes and reads moving toward the operator
+(ingress, O1); no chart code changes for the direction and no per-row
+text: toward and from clients is what the two halves mean, stated in O3
+and here, and the arrows stay the only direction marks, as on every other
+chart. The provider Local chart's upper half is the client's upload
+relayed out, so the two charts' upper halves read differently relative to
+the client; a flipped presentation, if ever wanted, is a chart option and
+not a series change. The count label reads `<compact count> reads/s`: `TransferChart`
+gains a count unit, `packets` by default and `reads` here, and the
+formatters gain the reads variant (apple `formatReadRate`, linux and
+windows `FormatCountRate(count, unit)`), the unit from `reads_per_second`
+(apple `String(localized: "reads/s")`, linux `T_("reads_per_second", "reads/s")`,
+windows `Loc("reads_per_second")`), so the byte label, the arrow and the
+opacity rules stay the chart's own.
+
+macOS.
+
+- Section: `ExtenderStatsSection` (new, `Main/Account/Earnings/ExtenderStatsSection.swift`),
+  a `VStack(alignment: .leading, spacing: 0)` of `UrLabel(text: "Extender statistics")`
+  in an `HStack` with a `Spacer()` and no chevron, `Spacer().frame(height: 8)`,
+  then `ExtenderStatsSection.chart(points: throughputStore.extenderPoints,
+  window: throughputStore.windowDuration)`, a static factory the tests
+  read, which returns the `TransferChart` of those points and that window
+  with `route: .remote`, `title: "Extender"`, `byteColor: .urLightBlue`,
+  `packetColor: .urPink` and `countUnit: .reads` at the default 128 pt.
+- Placement: `EarningsView.providerCard`, between the reliability block
+  and `ProviderStatsSection(navigate:)`: `if extenderStatsVisible {
+  ExtenderStatsSection(); Spacer().frame(height: 12); Divider();
+  Spacer().frame(height: 12) }`, where
+  `extenderStatsVisible`, a private property of `EarningsView`, is
+  `extenderStatsSectionVisible(provideControlMode:hasProviderStats:extenderRunning:)`
+  in `ExtenderStatsSection.swift`: the provider gate above,
+  `providerStatisticsVisible(provideControlMode:hasProviderStats:)`
+  in `ProviderStatsSection.swift`, which the reliability
+  block and `ProviderStatsSection` read as well, and
+  `deviceManager.extenderProvideStatus.enabled` (N7's model, fed by the
+  pushed status). The card then reads reliability, divider, extender
+  statistics, divider, provider statistics, each divider with its 12 pt
+  below as today.
+- Store: `ThroughputStore` gains `@Published private(set) var extenderPoints: [ThroughputPoint]`
+  from `contractViewController.getExtenderThroughputPoints()`, read in
+  `update()` on the same tick as the provider points and published only
+  when changed, mapped by `ThroughputStore.mapPoints`, now internal so the
+  tests reach it, and cleared in `reset()`. `setup(_:)`, which opens a new
+  controller whenever the window shows again or the device changes, seeds
+  `hasProviderStats` from `device.getProviderPacketStats()` through
+  `update(hasProviderStats:)`, one rpc on the main queue, and every tick
+  after it reads the controller (the rule above). The store reads no
+  extender stats: the section's presence is the status's `enabled`, and
+  the sdk polls `getExtenderStats()` itself for the series.
+- Provider section: unchanged but for the read-only row of N7 under
+  `ProvideModeRow` and its `providerStatsEnabled`, which reads
+  `providerStatisticsVisible`; the section's tap still opens
+  `.providerContracts`.
+
+Linux and Windows, the provider section (O5).
+
+The provide mode row moves from above the reliability group into the new
+Provider statistics group, where macOS keeps it; reliability stays above
+both new groups, as it is above the provider section on macOS. The
+network pane then reads, top to bottom: the ranking block, the
+leaderboard switch and note, the points block, the snackbar surface,
+on Windows the earning multipliers group, which stays in place, the
+Network reliability group, the Extender statistics group, the Provider
+statistics group. The provider section's disabled state is the reliability
+group's mechanism, the group header's meta label, rather than a body line:
+`providing_disabled` shows there while the provider statistics are not
+visible, and the chart rows collapse. The provider transport bar opens the
+existing `TransportSheet` (linux) or `TransportSettingsSheet`
+(windows) in its provider kind, which both already support. The sheet
+closes when the window hides to the tray, since a sheet may not
+outlive the surface that feeds it: left open, it would float alone
+over the desktop on Linux and come back on Windows holding a draft
+and a transport status read before the hide. A minimize on Windows
+keeps the sheet, as it keeps the window. Neither app has a provider
+contracts screen fed by provider data: `ContractsSheet` and
+`ClientContractsSheet` accept `ContractDetailsMode::Provider` but read the
+client feed, and neither `SdkHost` opens
+`openProviderContractDetailsViewController`; so the group header is
+static until both have a provider contracts feed, the deferral O5
+records. Charts are the pane's 132 px rows and the Blocked chart is
+66 px, where macOS draws it at 64 pt; all three apps keep these heights.
+The chart's 30 px stats band and two 13 px peak label bands leave that
+height a plot of about 10 px, which the chart's 8 px floor on each half
+of the plot draws 16 px tall, legible as the secondary series it is; a
+change to the half height layout changes the three apps together.
+
+Linux.
+
+- Groups: `EarningsPage::BuildNetworkPane`, after the reliability card:
+  `extenderStatsHeader_` from `kit::MakePaneGroupHeader(T_("extender_statistics", "Extender statistics"))`;
+  `extenderChartRow_` from `MakeChartRow(132, extenderChart_)`, the
+  page's helper for a `kit::MakePaneRow(132)` holding
+  `extenderChart_` (`TransferChart(T_("extender", "Extender"), TransferChart::Route::Remote, kUrLightBlue, kUrPink, TransferChart::CountUnit::Reads)`,
+  hexpand and vexpand, appended into the row's inner box, the first child
+  `MakePaddedRow` reaches, the way `ConnectPage::BuildPaneC` adds a chart);
+  then `providerStatsHeader_` from
+  `kit::MakePaneGroupHeader(T_("provider_statistics", "Provider statistics"))`
+  whose `meta` carries `T_("providing_disabled", "Providing is disabled")`
+  or nothing through `kit::SetTextOrCollapse`; the moved `provideModeRow_`;
+  the read-only `extenderRow_` (N7); `localChartRow_` (132, `TransferChart(T_("local", "Local"), Route::Local, kUrGreen, kUrPink)`);
+  `providerTransportRow_` from `kit::MakePaneRow(-1)` holding
+  `providerTransportBar_` (`TransportBar`, `SetSurfaceColor(kUrBackground)`,
+  margins 10 top and bottom, exactly pane B's bar) whose `on_activate`
+  opens `providerTransportSheet_`, a `TransportSheet(*parent, host_, TransportSheet::Kind::Provider)`
+  created on first use as `ConnectPage::OpenTransportSheet` does;
+  `blockedChartRow_` (66,
+  `TransferChart(T_("blocked", "Blocked"), Route::Block, kUrCoral, kUrMutedCoral)`
+  with `set_content_height(kBlockedChartHeight - 1)`: a
+  `Gtk::DrawingArea`'s content height is also its minimum, so
+  the chart's default 128 would grow the row to 129, and 65 with
+  the row's 1 px hairline is 66). The extender header and chart
+  row `set_visible(extenderVisible)`; the three provider rows
+  `set_visible(providerVisible)`; the bar gets `BeginLoading()` when its
+  row becomes visible before a distribution and `SettleEmpty()` when
+  hidden.
+- Feed: `SdkHost` gains `ProviderThroughputPoints()`,
+  `ExtenderThroughputPoints()` (each
+  `std::optional<urnet::ThroughputPointList>`, the
+  shape of `ThroughputPoints`), `HasProviderStats()`
+  (`contractVc_->getProviderPacketStats().has_value()`)
+  and `DeviceHasProviderStats()`
+  (`device_->getProviderPacketStats().has_value()` under the host mutex,
+  one rpc), all nullopt or false with no session; the running state
+  of the role is the `Enabled` of the status `GetExtenderProvideStatus()`
+  answers when the page re-reads it on the N7 drawer event, so the host
+  reads no extender stats. `MainWindow` forwards `DrawerEvent`s to
+  `earningsPage_->OnHostEvent(event)` under the same visibility
+  gate as `connectPage_`, and its `reconcilePresentation` calls
+  `earningsPage_->SetPresentationActive(windowVisible_)` beside the
+  connect page's: hiding to the tray hides `providerTransportSheet_`,
+  and showing re-reads as a device lifecycle does, since every
+  drawer event was dropped while hidden. The page pulls the two
+  point lists, the window, `ProviderTransportDistribution()` and
+  the provider flag in one `PullProviderThroughput(bool forced)`
+  that mirrors `ConnectPage::PullThroughput`: forced at
+  build, on `DrawerEvent::DeviceLifecycle` and on show, when
+  the host may just have opened a new controller, it asks
+  `DeviceHasProviderStats()`, and on `DrawerEvent::Throughput` it
+  reads `HasProviderStats()`. It applies the visibility rule from
+  `extender::StatsSectionsFor(providingEnabled, hasProviderStats, extenderRunning)`
+  in `ExtenderProvidePresentation.hpp`, which returns `{providerVisible,
+  extenderVisible, disabledMeta}`. `ApplyProvideState` keeps the
+  `providingEnabled_` gate and `ApplyExtenderProvideState` (N7) keeps
+  `extenderRunning_`, each re-applying the rule when its input flips. On
+  `DrawerEvent::ProviderTransportSettings` the page re-reads the
+  distribution, so the bar's unused footer follows the policy at once.
+  The charts redraw on their own timers, as every `TransferChart` does.
+- Chart: `TransferChart` gains `enum class CountUnit { Packets, Reads }` as
+  a trailing constructor parameter defaulting to `Packets`; `Reads` labels
+  the count rows through `TransferChart::CountRateText` with
+  `FormatCountRate(value, T_("reads_per_second", "reads/s"))`, which lives
+  with `FormatCountCompact`, moved out of `Formatters.cpp`, in the new
+  header-only `CountFormat.hpp` that `Formatters.hpp` includes, so the
+  unit tests reach the label with the compact count it carries.
+
+Windows.
+
+- Markup: `MainWindow.xaml`, `WalletPaneC`, after `ReliabilityCard`:
+  `WalletExtenderStatsHeader` (`Border` on `UrGroupHeaderStyle` with
+  `TextBlock x:Name="WalletExtenderStatsHeading"` on `UrGroupHeaderTextStyle`),
+  `WalletExtenderChartRow` (`Border` on `UrPaneRowStyle`,
+  `MinHeight="0"`, `Padding="12,0"`, the inset of
+  every chart row on the Connect page, holding
+  `<Grid x:Name="WalletExtenderChartHost" Height="132" />`);
+  `WalletProviderStatsHeader` (the same header with
+  `WalletProviderStatsHeading` and, right aligned on `UrPaneMetaStyle`,
+  `WalletProviderStatsStatus` for `providing_disabled`); the moved
+  `WalletProvideModeButton` row; `WalletExtenderRow` (N7);
+  `WalletProviderLocalChartRow` with `<Grid x:Name="WalletProviderLocalChartHost" Height="132" />`;
+  `WalletProviderTransportBarRow`, a plain `Border` that exists only to
+  be collapsed, with `<Grid x:Name="WalletProviderTransportBarHost" />`,
+  since the `TransportBar` root is its own pane row button
+  with its hairline and padding, as the Connect page's bare
+  `TransportBarHost` is; `WalletProviderBlockedChartRow` with
+  `<Grid x:Name="WalletProviderBlockedChartHost" Height="66" />`, the two
+  chart rows shaped as the extender's. Every chart host is clipped by
+  `kit::ClipToBounds` (`UrComponents.h`), which moved out of
+  `ConnectPage.cpp` so the Connect page's three charts and these three
+  share one clip. `WalletPage::ApplyStrings` sets the two headings.
+- Charts: `WalletPage::BuildCharts`, called from `Initialize`, creates
+  `extenderChart_` (`TransferChart(host, Localized("extender"), ThroughputRoute::Remote, colors::kUrLightBlue, colors::kUrPink, CountUnit::Reads)`),
+  `providerLocalChart_` (`Localized("local")`, `Local`, `kUrGreen`, `kUrPink`),
+  `providerTransportBar_` (`TransportBar(host, …)` whose click runs
+  `ShowProviderTransportSettingsSheet()`, a copy of
+  `ConnectPage::ShowTransportSettingsSheet` for `TransportSettingsKind::Provider`
+  under the window's `sheetOpen` gate, opening on
+  `connect().ProviderTransportSettings()`, the provider policy the
+  settings listener last pushed, which `ConnectPage` keeps and exposes,
+  so opening reads nothing from the device on the UI thread), and
+  `providerBlockedChart_` (`Localized("blocked")`, `Block`, `kUrCoral`,
+  `kUrMutedCoral`). `chartTimer_`, a `DispatcherQueueTimer` at `ConnectPage`'s
+  interval, ticks the three charts and the bar in `OnChartTick` only while
+  `WalletView()` is visible, the gate `ConnectPage::OnChartTick`
+  applies to `ConnectView()`, and runs only while the window presents,
+  started and stopped by `WalletPage::SetPresentationActive`, which
+  `MainWindow::SetPresentationActive` calls beside the Connect page's.
+  `AppController::HideWindow`
+  closes every open sheet before the window hides to the tray, the
+  provider transport sheet among them, through
+  `MainWindow::CloseSheetsForHide()`, which hides each open
+  `ContentDialog` that `VisualTreeHelper::GetOpenPopupsForXamlRoot`
+  finds on the window's XamlRoot; `Hide()` ends each sheet's
+  `ShowAsync` and clears the `sheetOpen` gate as any dismissal does,
+  and a sheet whose `Closing` guard refuses a dismissal, the seedphrase
+  sheet, stays open. A minimize, which also stops the presentation,
+  keeps every sheet.
+- Feed: `SdkHost` gains `ProviderThroughputSnapshot{providerPoints,
+  extenderPoints, windowSeconds, hasProviderStats,
+  providerDistribution}`, the last two `std::optional`
+  and engaged when a publish carries a reading, a
+  `ProviderThroughputHandler` set by `SetProviderThroughputHandler`,
+  and `CurrentProviderThroughput()` for the seed when the wallet
+  view shows, which `WalletPage::Initialize` also takes through
+  `ResyncProviderStats()` before its first `ApplyStatsSections`.
+  `PublishThroughput` fills the snapshot on the same tick from
+  `getProviderThroughputPoints()`, `getExtenderThroughputPoints()`,
+  the controller's `getProviderPacketStats().has_value()` and
+  `MapTransportDistribution(getProviderTransportDistribution())`,
+  and publishes the provider distribution only when it changed, as
+  the client one. The moments that open a controller ask the device
+  instead through `DeviceHasProviderStatsLocked()`, one rpc on the
+  host's worker with its mutex held, since the UI thread takes no host
+  lock and makes no rpc: the initial publish of `SubscribeDrawer()`
+  when a presentation opens, and a `BootstrapSession()` with no
+  presentation, which caches the answer for the seed. A hide to the tray
+  keeps what the host knew: `ClosePresentationLocked(sessionEnding)`
+  and `ClearDrawer(sessionEnding)` forget the extender provide
+  status and the provider flag, and push the empty status and
+  `hasProviderStats` false, only when the session ends; a hide pushes
+  `hasProviderStats` disengaged, so a window shown again keeps
+  its rows and groups until the new presentation's reads confirm
+  them. The host reads no extender stats, since the running state
+  of the role is the `enabled` of the `ExtenderProvideStatusView`
+  of N7. `WalletPage::ApplyProviderThroughput` sets the points on
+  the charts, the distribution on the bar (`BeginLoading` before
+  the first, `SettleEmpty` when hidden), the provider flag when the
+  snapshot carries one, and the visibility of the two groups from
+  `ExtenderStatsSectionsFor(providingEnabled, hasProviderStats, extenderRunning)`
+  in `ExtenderPresentation.h`, the same shape as linux's;
+  `ApplyProvideState` keeps `providingEnabled_` and
+  `ApplyExtenderProvideState` keeps `extenderRunning_`, each re-applying
+  the rule when its input flips.
+- Chart: `TransferChart` gains `enum class CountUnit { Packets, Reads }` as
+  a trailing constructor parameter defaulting to `Packets`; `Reads` labels
+  the count rows with `FormatCountRate(value, Narrow(Localized("reads_per_second")))`,
+  a new `StatsFormat` function beside `FormatPacketRate`.
+
+Mockups. The provider statistics visible and the role active; a hidden
+extender section leaves the reliability block directly above the provider
+title.
+
+```
+macOS, Earnings, the provider card (UrLabel 12, chart 128 / 64)
+
+ ┌────────────────────────────────────────────────────────────────┐
+ │ Network reliability …                                          │
+ │ ────────────────────────────────────────────────────────────── │
+ │ Extender statistics                                            │
+ │ Extender                     1.2 MiB/s   340 reads/s ▲         │
+ │                              3.4 MiB/s   512 reads/s ▼         │
+ │ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ │  urLightBlue / urPink
+ │ ────────────────────────────────────────────────────────────── │
+ │ Provider statistics                                          › │
+ │ ● Provide mode                                        Auto   › │
+ │ ● Extender                                                   › │
+ │   Active · IPv4 and IPv6                                       │
+ │ Local                        0.9 MiB/s   210 pkt/s ▲           │
+ │ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ │  urGreen / urPink
+ │ Transports                                                   › │
+ │ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+ │ ● H3 62%  ● H1 38%        unused ○ whodis ○ whodis pump        │
+ │ Blocked                                                        │
+ │ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ │  urCoral / urMutedCoral
+ └────────────────────────────────────────────────────────────────┘
+```
+
+```
+linux, Earnings page, pane C "Network earnings" (380 px; windows WalletPaneC
+is the same column with the same names)
+
+ ┃ NETWORK RELIABILITY                                      ┃
+ ┃ [reliability card]                                       ┃
+ ┃ EXTENDER STATISTICS                                      ┃
+ ┃ Extender                1.2 MiB/s   340 reads/s ▲        ┃
+ ┃                         3.4 MiB/s   512 reads/s ▼        ┃
+ ┃ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ┃  132 px, kUrLightBlue / kUrPink
+ ┃ PROVIDER STATISTICS                                      ┃  meta: "Providing is disabled" when gated
+ ┃ ● Provide mode                                  Auto   › ┃
+ ┃ ● Extender                                             › ┃
+ ┃   Active · IPv4 and IPv6                                 ┃
+ ┃ Local                   0.9 MiB/s   210 pkt/s ▲          ┃
+ ┃ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ┃  132 px, kUrGreen / kUrPink
+ ┃ Transports                                             › ┃
+ ┃ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ┃
+ ┃ ● H3 62%  ● H1 38%      unused ○ whodis                  ┃
+ ┃ Blocked                                                  ┃
+ ┃ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ┃  66 px, kUrCoral / kUrMutedCoral
+```
+
+Checklist and tests.
+
+- apple (`app/network`): new `Main/Account/Earnings/ExtenderStatsSection.swift`;
+  change `Main/Account/Earnings/EarningsView.swift`,
+  `Main/Account/Earnings/ProviderStatsSection.swift`
+  (`providerStatisticsVisible`),
+  `Shared/ViewModels/ThroughputStore.swift`,
+  `Shared/Views/Stats/TransferChart.swift` (`countUnit`),
+  `Shared/Utilities/RateFormatUtils.swift` (`formatReadRate`).
+  Tests: new `networkTests/ExtenderStatsSectionTests.swift` in the style of
+  `TransportStatsTests.swift`: the visibility rule as a pure function
+  (`extenderStatsSectionVisible(provideControlMode:hasProviderStats:extenderRunning:)`,
+  every combination) and its following `providerStatisticsVisible`
+  for every mode and stats flag, the chart binding through
+  `ExtenderStatsSection.chart(points:window:)` (route, title, colors,
+  unit, height and window), `formatReadRate(340) == "340 reads/s"` and
+  the compact forms, the store's mapping of an extender point list and of
+  an empty one.
+- linux (`app`): new `src/CountFormat.hpp`, new
+  `tests/CountFormatTest.cpp` added to the test source list in
+  `meson.build`; change `src/SdkHost.hpp`, `src/SdkHost.cpp`,
+  `src/EarningsPage.hpp`, `src/EarningsPage.cpp`, `src/MainWindow.cpp`,
+  `src/TransferChart.hpp`, `src/TransferChart.cpp`, `src/Formatters.hpp`,
+  `src/Formatters.cpp`, `src/ExtenderProvidePresentation.hpp`
+  (`StatsSectionsFor`). Tests: `StatsSectionsFor` over every combination
+  in `tests/ExtenderProvidePresentationTest.cpp`, as a literal table;
+  `CountFormat_Rate`, the reads label with its compact count at 340,
+  1234, 12345, 1234567 and 0, in the unit binary, which reaches
+  `CountFormat.hpp` because it needs neither the sdk header nor glib, as
+  `Formatters.cpp` does; the chart bindings are reviewed (O7).
+- windows (`app`): change `src/App/SdkHost.h`, `src/App/SdkHost.cpp`,
+  `src/App/AppController.cpp`, `src/App/MainWindow.xaml`,
+  `src/App/MainWindow.xaml.h`, `src/App/MainWindow.xaml.cpp`,
+  `src/App/WalletPage.h`, `src/App/WalletPage.cpp`, `src/App/ConnectPage.h`
+  and `src/App/ConnectPage.cpp` (`ProviderTransportSettings()`, the shared
+  clip), `src/App/UrComponents.h` and `src/App/UrComponents.cpp`
+  (`kit::ClipToBounds`), `src/App/TransferChart.h`,
+  `src/App/TransferChart.cpp`, `src/App/StatsFormat.h`, `src/App/StatsFormat.cpp`,
+  `src/App/ExtenderPresentation.h`, `src/App/ExtenderPresentation.cpp`
+  (`ExtenderStatsSectionsFor`). Tests: `ExtenderStatsSectionsFor` over
+  every combination in `tools/extender-tests.cpp`, as a literal table;
+  the chart bindings and the rest are reviewed, not compiled, on the
+  macOS build host, as the windows tree has been.
+
+### P. Camouflage: the authenticated hello and the splice (REALITY)
+
+Added 2026-10-07 at the owner's request ("incorporate the best parts of
+reality into the extender; the extender does almost all of what reality does
+already"). The extender already terminates the outer TLS for a borrowed server
+name, issues a per-name leaf under its identity key, and the client already
+pins that leaf to the record key (A2, A3, B3, net_extender.go newExtenderTlsConfig).
+What REALITY adds over that is three things the extender does not yet have: the
+client's own ClientHello is a browser's rather than Go's; the proof that the
+client holds the extender's key is hidden inside that browser hello, so there
+is no distinguishing first flight; and a hello that does not carry the proof is
+spliced to the real borrowed site, so an active prober sees the real site with
+its real certificate rather than a self-signed leaf for a name the extender
+does not own. This section folds those three into the tcp carrier. It is tcp
+only (P9); the udp carriers keep A1 to A12 unchanged. Where it changes an
+earlier decision for the tcp carrier it says so: it supersedes A2's "always
+terminated, no splice" for the tcp carrier in splice mode (P3), and it narrows
+A5's reverse proxy to the degraded fallback and the non-tcp carriers (P3). It
+reuses, not imports, REALITY: the construction is native to the extender
+protocol (P0), built from connect's own X25519, HKDF and AES-GCM and from the
+reality client helpers that already live in connect for VLESS
+(vless_reality.go), on the extender's own certificate issuer, demultiplexer,
+admission limiter (A12) and whitelist. xtls/reality is not imported (P0).
+
+P0. Why native, not the library. xtls/reality's `Server` is a fork of
+crypto/tls that dials the borrowed site on every connection and mirrors the
+whole handshake to it (its `MirrorConn`), keeps its post-handshake record
+lengths in a process-global `sync.Map` filled by a background dial per server
+name (`DetectPostHandshakeRecordsLens`), carries juju/ratelimit and
+go-proxyproto, and has no replay cache and no demultiplexer for the three
+client shapes the extender serves (v1-framed, v2 http, and now camouflaged).
+The extender already owns every piece the library reimplements: TLS
+termination with a cached per-name leaf (extender_cert.go), a three-way
+demultiplex in front of it (extender.go HandleExtenderConnection), the A12
+admission limiter, the A5 whitelist and reverse proxy, and the reality client
+half (vless_reality.go: the session-id seal, the browser hello through utls,
+the leaf-proves-key verifier). The camouflage layer is therefore a peek and an
+auth check in front of the existing `tls.Server`, a splice path that reuses the
+A5 bounds, and a client dial that reuses the vless seal — not a second TLS
+stack. utls is already linked (vless_dial.go, vless_reality.go), so there is no
+new module and no size cost. The feat/chrome-client-hello branch (owner request
+2026-10-07, a sibling change) brings the browser hello to the normal and
+resilient dialers and adds the kill switch `ConnectSettings.TlsClientHelloFingerprint`;
+this design reuses that switch for the camouflaged carrier and takes that
+branch's uTLS plumbing as the precedent, and it resolves the "a Chrome ALPN
+would get 403, separate change" note that branch left for the extender (P4).
+
+P1. The authenticated hello. The proof rides in the 32-byte legacy session id
+of the client's ClientHello, exactly as REALITY and exactly as the VLESS client
+already builds it (vless_reality.go vlessRealitySealSessionId). The pieces:
+
+- Server static key. The extender identity is an ed25519 seed
+  (extender_record.go ExtenderPrivateKeyFromSeed). The X25519 static key the
+  ECDH needs is derived from that same seed with HKDF-SHA256, salt empty, info
+  `"ur-extender-reality-x25519-v1"`, 32 bytes, through `crypto/ecdh`
+  X25519().NewPrivateKey, so there is no new secret to persist and the static
+  key rotates with the identity. Its public half is published in the record
+  (P6). Only the extender holds the seed, so only the extender derives the
+  private key; the activator learns the public half from the activation args
+  and the client from the signed record (P6).
+- shortId. The 8-byte `ExtenderKeyId(ed25519 public key)` that already exists
+  (extender_record.go, first 8 bytes of sha256 of the key). It is not a new
+  stored or published value: both ends compute it from the record's identity
+  key. It is sealed in the plaintext so the server can confirm the tag was
+  built for this extender and not resealed from a tag captured at another.
+- Key agreement. The client's ephemeral X25519 is the one its TLS 1.3
+  ClientHello already carries as a key share (reused, as vless_reality.go reuses
+  `HandshakeState.State13.KeyShareKeys.Ecdhe`/`MlkemEcdhe`), so nothing extra
+  goes on the wire. `sharedSecret = ECDH(client ephemeral, server static pub)`
+  on the client and `ECDH(server static priv, client ephemeral pub)` on the
+  server, both reading the ephemeral from the hello's X25519 or X25519MLKEM768
+  key share.
+- KDF. `authKey = HKDF-SHA256(sharedSecret, salt = helloRandom[:20],
+  info = "ur-extender-reality-v1", 32)`.
+- Plaintext (16 bytes): a 3-byte client version `{2,0,0}` so the server can
+  bound min and max client versions as REALITY does, one reserved zero, a
+  4-byte big-endian unix time, and the 8-byte shortId.
+- Seal. AES-256-GCM under authKey (a 32-byte key), nonce `helloRandom[20:]`
+  (12 bytes), additional data the marshaled ClientHello with its session-id
+  field zeroed, output 16 + 16 = 32 bytes, which is exactly the session-id
+  length it replaces.
+
+What it binds: the identity, because only the holder of the matching static
+private key derives authKey, and the shortId in the plaintext ties the tag to
+this extender's key; and the time, in the plaintext, checked against a window.
+The additional data is the whole hello, so a tag cannot be lifted onto a
+different hello: a different random or key share changes both the data and the
+nonce, and the open fails. `ExtenderCamouflageTimeWindow` (default 2 minutes)
+is the tolerated skew each way; a client whose clock is outside it seals a time
+the server rejects and falls back to the legacy dial (P4, E/client).
+
+P2. Replay protection — the one thing REALITY lacks. REALITY accepts any hello
+whose tag opens and whose time is in window; it keeps no record of tags it has
+seen, so a prober that captures one authenticated hello and resends it
+verbatim is handled on the authenticated path rather than spliced, which tells
+the prober the server is not the borrowed site (the server does not fall back
+to it). The extender closes this: a bounded, time-windowed seen-tag set keyed
+on the 32-byte sealed session id. On a hello whose tag opens and whose time is
+in window, the server checks and inserts the tag; a tag already present is a
+replay and is handled exactly as an unauthenticated hello — spliced to the real
+site (P3) — so a replay is indistinguishable to the prober from any other
+probe. Entries expire after `2 × ExtenderCamouflageTimeWindow` (a tag older
+than that fails the time check anyway, so nothing older need be remembered) and
+the set is capped at `ExtenderCamouflageReplayTagCount` (default 65536, oldest
+evicted); an eviction under flood can at worst let one replay through as a
+fresh auth, which is harmless, because the replayer holds the client ephemeral
+public key but not its private half and so cannot finish the TLS 1.3 handshake
+or send any inner byte — the replay buys nothing but the handshake the server
+would complete for any authenticated hello, and the seen-tag set removes even
+that signal in the common case. The set keys on the session id, which is a
+deterministic function of the client's 32-byte random, so two genuine dials
+never collide.
+
+Verification cost on the server (the prototype measured 0.48 us to parse the
+hello and 43 us for the auth check, the X25519 ECDH being almost all of the
+43 us). The ECDH is spent only on a hello that could be authenticated: the
+session id is exactly 32 bytes and the hello carries an X25519 or
+X25519MLKEM768 key share. A plain Go client with no session id, a legacy
+extender client, and most probers skip the ECDH on that gate. After it, the
+AES-GCM open is cheap, the time check and the seen-tag check are a map
+operation. The whole check sits behind the A12 admission limiter and its
+per-subnet and refusal caps, so the ECDH rate is bounded under flood by the
+same machinery that bounds every other action.
+
+P3. The demultiplex and the splice. The tcp carrier's accept path gains a peek
+in front of `tls.Server`. The server reassembles the first TLS handshake
+record or records into the complete ClientHello without consuming them — the
+resilient client fragments the hello across records and segments
+(net_resilient.go), and a Chrome hello with an ML-KEM key share is ~1.7 to
+2 KB, so the reassembly reads TLS record headers (type 22, a handshake) and
+accumulates handshake bytes up to a bound (`ExtenderCamouflageHelloMaxByteCount`,
+16 KiB) before parsing — then parses it (through the utls/tlshacks parser the
+package already links) for the random, the session id, the key shares, the SNI
+and the ALPN, and keeps the read bytes to hand to whatever serves the
+connection next, exactly as newConnWithInitialBytes already prepends read bytes
+today. The first bytes that are a v1 length prefix (≤ 1024) are still the v1
+path (A3); the camouflage peek applies only to a TLS ClientHello, which is what
+the tcp carrier's outer bytes always are.
+
+The three outcomes:
+
+- Authenticated (tag opens, time in window, not a replay). The buffered-and-
+  following bytes go to `tls.Server` with the identity certificate
+  (GetCertificate, unchanged) and an authenticated `tls.Config` whose
+  `NextProtos` is `{"http/1.1"}` alone (P4). The handshake completes with the
+  identity leaf — encrypted in TLS 1.3, so a passive observer never sees it —
+  and the existing v2 http request path (A3) runs inside unchanged: the client
+  still sends the extender header, and the whitelist (A5), the admission
+  limiter (A12), the services (A8) and everything else apply as before. The
+  client still verifies the leaf under the record key (B3). The session-id tag
+  is an outer gate that makes the first flight look like a browser's visit to
+  the borrowed site; it does not replace any inner check.
+- Unauthenticated, splice mode on (`ExtenderCamouflageSplice`, P7). The SNI
+  names a borrowed site on the bundled splice list (P5); the extender resolves
+  it over its DoH cache on the client's family (A7), opens a tcp connection to
+  it on 443, writes the buffered ClientHello to it and relays raw bytes both
+  ways. The real site completes its own handshake with its own CA-valid
+  certificate, so an active prober — including a prober replaying a captured
+  authenticated hello (P2) — sees the real site, which is what REALITY's
+  fallback achieves and what closes the "a prober that validates certificates
+  sees a misconfigured host" limitation (section 6). The relay is raw tcp (the
+  bytes are the prober's TLS to the real site; the extender cannot and does not
+  inspect them), so the only in-band controls are byte and time bounds: the A5
+  bounds reused — relayed bytes per connection 8 MiB, idle 30 s — plus the A12
+  per-subnet rate, a total concurrent-splice cap
+  (`ExtenderCamouflageSpliceMaxCount`), and a per-target cap
+  (`ExtenderCamouflageSpliceMaxPerTarget`) so no one borrowed site is hammered
+  by one extender. A borrowed SNI the extender cannot reach falls to another
+  reachable borrowed target of the same family, so the prober still gets a real
+  site; only when none is reachable does it degrade to the A5 reverse proxy
+  (terminate, self-signed, real content), the one case the old tell returns.
+- Unauthenticated, splice mode off (`ExtenderCamouflageSplice` false — the
+  migration default and the legacy-safe posture). The hello is terminated as
+  today: GetCertificate issues the per-name leaf, and the inner v1 or v2 http
+  path or the A5 reverse proxy serves it. A legacy extender client (Go TLS, a
+  spoof SNI, no tag) is indistinguishable from a prober at the ClientHello, so
+  it can only be served while unauthenticated hellos are terminated; this is
+  why splice is a flag and not the first posture.
+
+Migration and retirement. Two phases, parallel to A3's "v1 acceptance dropped
+one release later". Phase A, `ExtenderCamouflageSplice` off: new clients send
+authenticated (browser) hellos and get the camouflage path; legacy clients send
+unauthenticated hellos and are terminated and served as today; probers get
+today's posture (a self-signed leaf for any name), unchanged. The passive win —
+no more Go fingerprint on a new client's first flight — lands in Phase A alone.
+Phase B, `ExtenderCamouflageSplice` on, flipped one release after new clients
+ship and legacy clients are retired: unauthenticated hellos are spliced, so
+probers get the real site, and any remaining legacy client breaks, which the
+retirement schedule already accounts for. The flip is an operator setting, not
+a code change.
+
+P4. The ALPN problem, resolved server-side. The server offers `{"h2","http/1.1"}`
+so a prober that asks for h2 gets it (A3); the extender protocol needs
+http/1.1, since the connection is hijacked and h2 cannot be (A3 refuses an
+extender request over h2 with 403). A real Chrome hello advertises
+`{"h2","http/1.1"}`, h2 first. The resolution is not to rewrite the client's
+ALPN — rewriting it to http/1.1 alone is a tell, a "Chrome hello that offers
+only http/1.1", which is why this design does not follow the VLESS dialer's
+ALPN rewrite (vless_dial.go) here — but to let the client send a faithful Chrome
+hello and have the server negotiate http/1.1 on the authenticated path: its
+authenticated `tls.Config` offers `{"http/1.1"}` alone, so the intersection
+with the client's `{"h2","http/1.1"}` is http/1.1 whatever the order. The
+selected protocol travels in the TLS 1.3 EncryptedExtensions, which are
+encrypted, so a passive observer sees the client's faithful `{"h2","http/1.1"}`
+in the plaintext hello and never sees the server's choice. The server knows a
+connection is authenticated before it hands it to `tls.Server` (the tag opened
+during the peek), so it picks the authenticated config then. A prober is never
+on the authenticated path, so its h2 request is unaffected: in Phase A it is
+terminated with `{"h2","http/1.1"}` as today, in Phase B it is the real site's
+own ALPN.
+
+P5. Borrowed names. The splice relays to the real site, so the borrowed name
+must be a site that is actually reachable, speaks TLS 1.3, offers an X25519 or
+X25519MLKEM768 key share (so the spliced handshake is as modern as the Chrome
+hello that fronted it), and is plausibly hosted on an arbitrary address rather
+than pinned to a well-known CDN range. The existing spoof list (A10,
+net_extender_spoof.go, the v1 service and mail names) is the wrong list for
+this: those are big-site names whose addresses a censor knows, so an extender
+on a home address claiming one is an obvious SNI-to-IP mismatch (section 6, and
+a limit REALITY shares). The camouflage splice therefore draws from a separate
+bundled list, `res/extender_borrow[_<cc>].bin`, in the same xor-masked gzip
+form as the spoof resource and with the same per-country override
+(SpoofDomainsForCountry's shape), curated for splice-friendliness — reachable,
+modern-TLS, not CDN-pinned, plausible in the region. The list is bundled in
+connect root, so the client draws its front SNI from it and the server
+validates and splices to it from one shared source; there is nothing per-
+extender to agree on. At role start the extender verifies each candidate it
+would use — a TLS 1.3 dial that reaches X25519/MLKEM and is not a shared CDN —
+and keeps only the ones that pass; an extender with none verified publishes no
+camouflage key and serves the legacy terminate path alone, so a bad list
+degrades to today rather than breaking. No borrowed list is bundled yet; like
+the country spoof lists it needs measurement first.
+
+P6. Records, activation, operator, gossip and TXT size. One new signed field
+on `ExtenderRecordBody`, `RealityPublicKey` (field 13, the 32-byte X25519
+static public key of P1). The shortId and the borrowed names are not in the
+record: the shortId is derived from the identity key both ends already have,
+and the front SNI is drawn from the bundled list (P5), which keeps the record
+and therefore the TXT value small. The body is signed opaquely
+(ExtenderRecord.Body, "ur-extender-record-v1"), so the new field is covered by
+the root signature and a reader that predates it skips it as an unknown proto3
+field and simply does not dial the camouflaged carrier — old clients skip
+unknown carriers by having no key to front with, which is non-fatal by
+construction. Activation gains one arg, `reality_public_key_hex`
+(ExtenderActivateArgs); an operator on an older binary ignores the unknown JSON
+field (Go's decoder does, without DisallowUnknownFields) and signs a record
+without the camouflage key, so activation stays non-fatal. Critically the
+camouflage does not add a new carrier string: it rides the existing `"tcp"`
+carrier, so the operator's `unknown carrier` refusal (server
+controller/extender_controller.go, the carrier loop) never fires on it. The
+activation probe is unchanged — it proves tcp forwards over the terminated path
+as today; the camouflage auth is proven client-side by the B3 leaf check, so
+the operator need not act as a camouflage client. Optionally the operator also
+dials the splice path with an unauthenticated hello and a borrowed SNI and
+expects the real site, a nice-to-have that verifies Phase B before it is
+flipped.
+
+TXT size. The record grows by the 32-byte key, ~44 base64 characters, so a
+dual-stack value moves from about 340 to about 384 characters, not the ~452 a
+borrowed name in the record would have cost — the reason the name is bundled
+rather than published. A location's TXT set holds up to `sample_count`
+(default 8) values, so the largest set stays near 8 × 384 ≈ 3 KB, at the C5
+bound; if a future field pushes past it, the extender TXT set's sample_count
+drops to 6 before the record carries anything larger, since EDNS0's 4 KB is the
+hard ceiling the C5 note set 3 KB inside of.
+
+P7. Flags, roles and metrics. `ExtenderSettings.CamouflageEnabled` (default
+false) gates whether the server recognizes auth tags, publishes a
+`RealityPublicKey` and negotiates the authenticated http/1.1 config;
+`ExtenderSettings.ExtenderCamouflageSplice` (default false) is the Phase-A→B
+flip of P3, meaningful only while CamouflageEnabled. The operator flag is off
+by default, as the owner asked; the provider-extender role carries a device
+default `DeviceLocalSettings.DefaultCamouflage` in the shape of
+`DefaultProvideExtender` (F3, G1), so an embedder sets the posture its users
+want. The client needs no flag: it uses the camouflaged tcp dial for any record
+that carries a `RealityPublicKey`, and the kill switch is the sibling branch's
+`ConnectSettings.TlsClientHelloFingerprint` set to `"go"`, which drops the
+camouflaged variant back to the legacy Go-TLS dial. Metrics: the extender
+counts authenticated, spliced and terminated tcp connections, replay-cache hits
+(replays refused), auth opens that failed the time window, splice-target dial
+failures and borrowed-name verification failures, carried on `ExtenderStats`
+and surfaced in the provide status beside the A12 admission counts.
+
+P8. Client dial. The camouflaged variant folds into the existing tcp carrier as
+one dialer, one strategy slot and one directory outcome — not a second carrier
+and not a second priority — the way the dns-port race is one dial over several
+ports (net_extender_dns_ports.go, the 250 ms stagger). The tcp dial becomes a
+camo-first-then-legacy staggered race: it launches the camouflaged attempt (a
+uTLS Chrome hello with the sealed session id of P1, through the vless_reality
+helpers generalized to the extender domain labels) at once, and the legacy
+attempt (today's Go-TLS dial, newExtenderTlsConfig) one stagger later while the
+first is pending, or at once if the first fails; the first to answer wins and
+the other is canceled and joined, exactly raceExtenderDnsPorts' shape. The
+camouflaged attempt is tried only when the config carries a `RealityPublicKey`
+(from a verified record, E5) and the fingerprint switch is not `"go"`; a config
+with no camouflage key runs the legacy attempt alone. Clock skew past the time
+window (P1) makes the camouflaged attempt fail its auth and the race fall to
+legacy. In Phase A that still reaches the extender, just without the
+camouflage. In Phase B the legacy attempt is spliced to the borrowed site and
+fails the B3 leaf check, so a skewed client loses the tcp carrier and reaches
+the extender over its udp carriers only. To keep that rare, the client seals
+with its clock corrected by a server-time offset learned from a verified source
+(the Date header of an authenticated platform API response or of a verified
+DoH answer); connect keeps no such offset today, so 14a adds one. The outcome
+the directory records is the tcp carrier's, as the dns
+race records one carrier outcome however many ports it tried, so a camouflaged
+attempt that fails neither holds the address nor spends a second slot. The
+resilient fragment and reorder wrapping (net_resilient.go) applies to the
+camouflaged attempt as it does to the legacy one; the server reassembles the
+fragmented Chrome hello during the peek (P3).
+
+P9. tcp only. REALITY is a TLS-over-tcp technique: the tag rides the TLS 1.3
+ClientHello and the splice is a tcp relay to the borrowed site. The udp
+carriers (quic on 443, the dns carrier on 4053 and 53) keep A1 to A12
+unchanged; QUIC has its own fingerprinting surface and the splice does not map
+onto it cleanly, so they stay identifiable on the same address (section 6,
+unchanged). The camouflage is a tcp-carrier property; a client that reaches an
+extender over quic or dns is exactly as it is today.
+
+P10. Tests. Deterministic, in-process, with a fake borrowed-site TLS server as
+the splice target, synthetic `.example` borrowed names and RFC 5737/3849
+addresses. Auth ok: a sealed hello whose tag opens and whose time is in window
+takes the authenticated path, terminates with the identity leaf, and the client's
+B3 check passes. Wrong key: a tag sealed against a different static key fails
+the open and is spliced (Phase B) or terminated (Phase A). Replay refused: the
+same authenticated hello twice is authenticated once and spliced the second
+time, and the replay counter increments. Skew fallback: a tag whose time is
+outside the window is not authenticated, and the client's race falls to the
+legacy attempt. Legacy client: a Go-TLS hello with no tag is terminated and
+served in Phase A and spliced in Phase B. Fragmented hello: a resilient client
+that fragments the Chrome hello across records is reassembled and authenticated.
+Bounded splice: the per-subnet, byte, idle, total and per-target caps each
+refuse past their bound, and a spliced byte is never counted as relay traffic
+(O1). ALPN: an authenticated connection negotiates http/1.1 though the client
+offered `{"h2","http/1.1"}`, and the selection is not on the wire.
+
+Phase (adds to section 5, after phase 9, independent of the gossip and alt
+work): 14. Camouflage. 14a (connect root, connect/extender, protocol): P1 to
+P10 — the seal and open generalized from vless_reality, the ClientHello peek,
+reassembly and parse, the authenticated http/1.1 config, the replay set, the
+splice with its bounds, the bundled borrow list, the `RealityPublicKey` record
+field and the X25519 static-key derivation, and the client's camo-first-then-
+legacy tcp race. 14b (server): `reality_public_key_hex` in activation, the
+stored and signed key, the optional splice probe. 14c (sdk): the role derives
+and publishes the static key (HKDF from the identity seed, no new persistence),
+`DefaultCamouflage`, the status counts, bindings. Acceptance: P10's tests pass;
+an authenticated client reaches an in-process operator through the camouflaged
+tcp carrier and the leaf verifies under the record key; a wrong key and a
+replay are spliced to the fake borrowed site; a legacy client works in Phase A;
+a skewed client falls back; the record grows by one field that old readers skip.
+
+### Q. The dns carrier's query shape (RFC 9619 and EDNS0)
+
+Q1. The dns carrier of A1 talks to the extender ip directly, so the pump
+variant does not apply, but the request shape does. Until 2026-10 a
+carrier request (`transport_pt_codec.go`, `encodeDnsRequest`) set the aa
+bit on the query and carried two TXT questions: the data question, whose first label holds the 18-byte pt
+header, and a second header-only "pump" question added so that each
+request would have a question for its response to answer. RFC 9619 (2024)
+makes a query with qdcount above 1 a malformed message, which a compliant
+resolver answers FORMERR and a firewall may drop, and the pair is a clean
+dpi match; there was no EDNS0 opt record. The server never used the pump
+question: `decodeDnsRequest` discards a header-only question that follows
+the data question, and the pump item a response is paired with
+(`decodeDns`, `pumpItem`) is the message id plus the header read from the
+data question.
+
+Q2. A request is now one standard query: opcode 0 and no flags (aa is a
+response bit; rd stays clear so the unchanged response, aa set and rd
+clear, reads as an authoritative answer to an iterative query), a single
+TXT question in the form of the old data question, and an EDNS0 opt record
+advertising a 1232-byte udp payload, the fragmentation-safe size of dns
+flag day 2020 and the default of other dns carriers. A response carries an
+opt record when, and only when, the paired request carried one (RFC 6891
+section 7); a pump item the decode53 mode synthesizes answers the way the
+client's latest real request asked. Everything else on the wire -- the
+header layout, the label encoding, the 157-byte request budget, the
+response's TXT answers -- is unchanged. Direct mode only: a recursive mode
+(resolver traversal, a delegated zone, rd set) is a separate design.
+
+Q3. Compatibility holds by construction, since the carrier has no version
+on the wire and a client's first datagram is already a QUIC initial, so
+nothing can be negotiated first. New client, old extender: the old decoder
+read the message id and the question section only, never the header flags
+or the additional section, so the new request decodes on it unchanged, and
+the response it sends is one the new client already accepts. Old client,
+new extender: `decodeDnsRequest` keeps discarding a header-only question
+after the data question, and a request without an opt record is answered
+byte for byte as before. The opt record is the capability signal. The
+legacy discard in the decoder can go once no deployed client emits the
+pump question.
+
+Q4. Tests, in-process only (`transport_pt_query_shape_test.go`,
+`transport_pt_roundtrip_test.go`, `transport_pt_codec_legacy_test.go`,
+`transport_pt_codec_test.go`): the raw header fields of every emitted
+request (qdcount 1, aa clear, one opt record of 1232) at the codec and at
+the socket the client translation wraps; frozen copies of the pre-change
+encoder and decoder for both interop directions; a round trip over an
+in-memory packet network with the server in require-pump mode, so a
+response proves the pairing, with the opt record echoed for a new client
+and absent for a legacy one; and edns detection that reads the opt record,
+not arcount. A1's forwarder split (A6) is unchanged: a TXT question
+outside every encoding tld is still a forwarder query.
+
+Q5. Decisions. The query keeps rd clear and the response is not touched:
+a response that copies rd (RFC 1035) and echoes its question is a
+response-side pass of its own, and with rd clear both halves of the
+exchange are consistent as they stand. No version field and no
+negotiation: the opt record marks a new client, which is all the server
+needs to know, and a negotiation would cost a round trip before the QUIC
+initial. The decoder stays tolerant of the legacy pump question rather
+than enforcing qdcount 1, which would strand every deployed client; a
+test pins that. A synthesized decode53 pump item follows the client's
+latest real request, so one client sees one response shape. The
+advertised payload is 1232 rather than 4096: nothing in the carrier needs
+more, and it is the size that passes every path.
+
+Q6. Phased. Nothing in connect. The server's `listenH3Dns` uses the
+exported constructor and takes the change on rebuild; no sdk surface
+changes. Still open on the response side: it answers with qdcount 0 and
+does not copy rd, which the recursive-mode design should take together
+with its delegated zone, since both are shape changes a resolver would
+notice. The legacy discard in `decodeDnsRequest`, and the frozen legacy
+codec the tests keep, can go once no deployed client emits the pump
+question.
+
+### R. Directory tiers: the sacrificial open tier, the gated tier, canaries (2026-10-07)
+
+The three discovery channels of D and E each hand an observer most of the
+fleet within about a week: the geo dns answers eight addresses per family per
+continent and rotates them every tick, the feed serves thirty-two random
+records to anyone, and gossip republishes every record to every member
+within a rotation. Camouflage (P) defends classification, not address
+harvesting, so the directory is tiered: an open tier that is sacrificial by
+design, served in small keyed partitions, and a gated tier the open channels
+never carry. The pure core -- partitions, the release policy, canaries and
+blocked state -- lives in connect so the server and every test run the same
+functions; the server wires it to its tables, the dns publisher and two
+routes.
+
+R1. Tiers. A record is signed into one tier: `ExtenderRecordBody.DirectoryTier`
+(field 13, additive; 0 open, which every record that predates the field is,
+1 gated; `ExtenderRecordGated`). The open tier is what the dns sets and TXT
+records, the feed sample and stream, and the cleartext gossip carry, and it
+is populated by volunteer extenders only, never operator hosts. The gated
+tier is the durable fleet: operator hosts, released only by the operator to
+an authenticated identity (R3) and carried by no open channel whatever
+source it arrived from -- the directory never publishes a gated record to
+its subscribers (the feed stream, the mesh), the feed never samples one, the
+gossip validator ignores one rather than relaying it, and the server never
+drips one, publishes one in dns, or hands one back as activation bootstrap.
+A gated record applied from a release, or leaked in from anywhere, is a
+candidate like any other, marked by `ExtenderCandidate.DirectoryTier` and the
+status entry. Revocations name a key and no address, so they flow on every
+channel as before, which is how a client holding a gated record learns it was
+withdrawn. The server assigns the tier at activation from `extender.yml`:
+`directory: {durable_network_ids: [...]}` names the operator's own account
+networks, whose extenders are gated; every other activation is open. A gated
+activation inserts no publish row and `network_extender.directory_tier`
+holds the tier.
+
+R2. Keyed partitions on the open channels (`net_extender_directory_partition.go`),
+in the shape of Psiphon's classic discovery. A channel pool of n records has
+`ExtenderPartitionCount(n)` partitions: the power of two at or above
+ceil(sqrt(n)), cut no finer than `ExtenderPartitionMinSize` (4) records per
+partition, so a fleet under eight is one partition and a fleet of a thousand
+is thirty-two. A record is placed by HMAC(secret, channel, "record", key)
+mod the count, so its place is stable while the count is; a vantage by
+HMAC(secret, channel, "vantage", vantage); an empty partition hands the
+vantage the next one around the ring; and each epoch deals a partition in
+the order of HMAC(secret, channel, "order", vantage, epoch, key)
+(`ExtenderPartitionMembers`, `ExtenderPartitionOrder`,
+`ExtenderPartitionSample`). A vantage therefore sees at most its partition --
+about sqrt(n) -- however often it polls, and the answer size only sets the
+pace. The channels `dns`, `feed` and `gated` are separate key spaces, so a
+partition that leaks on one says nothing about the others (R4). The epoch of
+the open channels is an hour (`ExtenderOpenEpochTimeout`); the count moves
+only when the fleet quadruples or quarters, and every placement is dealt
+again when it does.
+
+Feed. The vantage is the client's address prefix, /24 for v4 and /48 for v6
+(`ExtenderVantageKey`, from the stream's remote address), so a poller cannot
+change partition by changing its last octets; a stream with no address, a
+pipe, is a vantage of its own. `SampleRecords(count, own, vantage)` serves the
+extender's own record first when it is open, then the epoch's order of the
+vantage's partition interleaved by family (`balanceRecordsByIpFamily`, which
+keeps the order it is given); the stream forwards an applied open record only
+when `OpenPartitionContains(vantage, key)`, and every revocation. The sample
+and stream partition the same complete open pool, including the server's own
+record; placing that record first happens after partitioning and never changes
+the partition count. The sample
+cap is 8 (was 32) and the client's default 8 (was 16): the partition is the
+bound, the cap the pace. The secret is per directory, drawn at construction
+(`PartitionSecret` pins it), never stored and never on the wire: a restart
+deals the partitions again, which costs nothing.
+
+Dns (server, `taskworker/work/extender_dns_publish.go`). Route 53 keys
+answers by the resolver's location, not its address, so the vantage of a
+set is its location: each continent and the default are one vantage of the
+`dns` channel with the operator's secret, derived from the root key
+(`ExtenderConfig.DirectorySecret`, HMAC of the seed under a fixed domain,
+never stored). A set is the epoch's sample of the location's partition of
+the open tier of that family, `sample_count` 3 per family (was 8), filled
+from the family's partition members elsewhere and then from the next
+partitions when short, so a short continent is still bound to few partitions
+rather than to the global pool. The tick stays ten minutes; the sets change
+only when the epoch turns, and an unchanged upsert is a no-op. The TXT sets
+vouch for exactly the addresses answered, as before. A resolver-keyed answer
+-- HMAC of the resolver or ECS /24 -- needs an authoritative answerer the
+operator runs; the same functions serve it with that vantage (R5).
+
+R3. Gated tier release (`net_extender_directory_release.go`; server
+`POST /network/extender-release`, client jwt). The identity is the account
+and the device together (network id and client id as bytes); it is placed in
+one partition of the gated fleet on the `gated` channel and dealt that
+partition each epoch of a week (`ExtenderReleaseEpochTimeout`), of which it
+takes the first eligible: one record while the identity is new, three once
+it has served thirty days (`ExtenderReleaseProbationTimeout`, the Lox shape;
+the client's creation time is the age). Asking again in the same epoch
+returns previously issued records that remain eligible. The ledger retains
+the complete issued set for the epoch: changing `ip_versions`, country,
+blocked status, or fleet availability cannot refund a disclosure. A blocked
+or removed record may therefore leave an empty answer until the next epoch.
+Requests are counted
+per identity (8 an hour) and per vantage -- the requester's asn as text, or
+its prefix (`ExtenderVantagePrefix`) where none is known (4096 an hour),
+refused requests counting too. A record is released to at most ten distinct
+identities per country over thirty days (Salmon's ten,
+`ExtenderReleaseMaxClientsPerExtenderPerCountry`), the identity's own earlier
+release never counting against it, so a long-lived host is never the one
+everyone in a country is told about. A record blocked in the requester's
+country (R4) and a record of a family the client cannot dial
+(`ip_versions`) are skipped. The policy reads and writes an
+`ExtenderReleaseLedger`: `ExtenderReleaseMemoryLedger` is the bounded
+in-process one (an operator of one process, and every test); the server's is
+`model.NetworkExtenderReleaseLedger` over `network_extender_release` and
+`network_extender_release_request`. Request counts, request stamps, country
+reservations and epoch history are one admission transaction. The memory
+implementation holds one lock; replicas share PostgreSQL transaction advisory
+locks for identity, vantage and country, acquired in a stable order.
+Country-wide serialization keeps lock use constant at three locks per
+admission. Read-committed statement snapshots ensure a waiting replica sees
+the previous commit. Eligibility is checked for one partition plus previously
+issued keys before admission, with one batched database query for blocked
+flags. Migration 795 indexes the identity/epoch disclosure lookup; removed
+fleet rows retain disclosure tombstones for the epoch.
+The released records are signed fresh at
+each release, so a client refreshes a record by asking again within its
+epoch, and applies them with source `release`, which is not a K4 event. The
+answer is `{records, epoch, count, probation}` with base64 records
+(`DecodeExtenderRecordBase64`), or `{error}` for a refused request.
+
+R4. Canaries and blocked state (`net_extender_directory_canary.go`). A
+canary is an operator-run extender in exactly one place: a dns canary is in
+its continent's sets every epoch, pinned, never filled into another
+location's set and never dripped; a gated canary is in the gated partition
+its key hashes to and in no open channel. The signed `CanaryChannel` field
+(field 16; fields 14 and 15 remain `WebRtcClientId` and `RealityPublicKey`)
+restricts redistribution even after a DNS record enters a client's directory.
+Canaries also use the gated wire tier, so older tier-aware readers suppress
+their open relays without understanding the new field. Ordinary records with
+an empty channel retain their existing tier behavior. Feed samples, streams,
+gossip validation and local gossip publication exclude channel-restricted
+records. DNS publishes a healthy regional canary even when it is the region's
+or address family's only record, with its matching TXT set; it never fills
+another region or the default set. `ExtenderCanaryPlace` names the channel and the partition or
+region, and `ExtenderAttributeBlockedCanaries` names each leaked place once
+for a set of blocked keys. The server holds the designation in
+`network_extender.canary_channel`. Blocked state is per country
+(`ExtenderBlockedState`): a record is blocked in a country when at least
+three distinct identities there reported it unreachable within a day
+(`POST /network/extender-block-report`, the reporter's country from its
+address) while the operator's own uptime probe reached it within the hour,
+so an outage is not a block and one reporter is not enough. Tables are
+bounded; the oldest reporter or entry goes. The server's view is a query
+over `network_extender_block_report` joined to the probe stamps. What a leak
+does beyond the release skipping blocked records -- suspicion on the
+partition's identities, migration of trusted ones -- is phased (R5).
+
+R5. Phased, in order: the sdk's release fetch, which calls the route with
+its client jwt on each refresh pass and applies the answer with
+`ExtenderDirectory.ApplyRecord(record, ExtenderSourceRelease)` (the
+directory side is in place); a reaper for the release and report tables;
+`bringyourctl` commands that set a tier and a canary; the per-partition
+suspicion and migration policy (Lox: migrate trusted users, hold new ones);
+an authoritative dns answerer keyed by the resolver or ECS /24; the
+unlisted share-code compartments (capped, expiring invites, never gossiped);
+and encrypted-blob gossip with liveness and revocation keyed by opaque ids,
+decryptable at the member's trust level, in place of cleartext record gossip
+-- until it lands, the mesh carries the open tier only, in cleartext, bound
+by nothing but the tier.
+
+R6. Tests. `net_extender_directory_tiers_test.go`: the partition count and
+its floor, stable channel-separated placement, the empty-partition ring, the
+epoch rotation, a vantage polling for a week seeing exactly its partition of
+sixty-four records, the open channels excluding a gated record that arrived
+over the mesh while it stays a candidate, the additive tier, the vantage
+prefix, the release policy's determinism and identity cap, vantage cap,
+probation, per-country client cap, blocked skip and ledger bounds, blocked
+state per country with the probe rule and its bounds, and a blocked canary
+mapping to exactly one place. `gossip/feed_server_tiers_test.go`: the feed
+sample and stream bound to the client's remote prefix at the served stream, a
+leaked gated record served by neither, and the validator ignoring one on the
+mesh. Server: the dns sampler excluding the gated tier, keyed by epoch and
+location, pinning a canary in its one region.
+
+### S. The peer-to-peer webrtc carrier and acceptance (2026-10-07)
+
+A home extender behind NAT has no public inbound address, so it serves none
+of the socket carriers of A1 and, under C2 as first written, could never be
+accepted. Volunteer relays behind NAT are the family that measurably kept
+users online in 2025-2026 (Conduit, Snowflake; reports/Circumvention
+strategies for connect.md, "Peer proxies and refraction"), and connect
+already carries a webrtc transport with ICE/STUN signaling over the
+exchange, so the carrier here is a rendezvous and a stream adapter, not a
+new transport. Two fingerprint lessons from the same research bound it:
+pion's default dtls ClientHello was block-listed by Russia's TSPU on
+2026-03-30, and two fixed STUN servers are a cheap prefilter signal. Both
+are addressed first (S4). The acceptance rule it lands with is C2a, which
+this section implements and does not restate.
+
+S1. The carrier. A dialer -- a client, or the operator's activation probe
+-- creates a peer connection with one ordered data channel labelled
+`ur-extender`, gathers its candidates, sends the SDP offer to the
+extender's rendezvous id through the exchange signaling (S2), applies the
+answer, and the data channel that ICE/STUN opens is one reliable byte
+stream: the ordinary A3 request (`POST /`, the header, the response frame)
+runs over it and the inner bytes follow, through the same handler as the
+tcp carrier, so a stream is refused, limited (A12), answered and forwarded
+exactly as a terminated tcp connection is. The extender server's
+`HandleWebRtcExtenderStream` serves the stream from its first bytes under
+the same connection accounting, with the ICE pair's remote address as the
+source the admission keys on and the forward family follows (A7). There is
+no outer tls and so no leaf to pin (B3): the data channel is already
+authenticated dtls, and the extender's identity is the challenge signature
+of its response, so a dial that knows the extender's key -- a verified
+record, a probe -- always challenges and verifies it itself, whatever the
+caller brought. `ExtenderConnectModeWebRtc` ("webrtc" in records and
+responses) is the carrier's connect mode; `dialExtenderStream` hands a
+profile in it to the carrier before it builds a header, so the strategy,
+the feed, the probes and the http client reach it through the dial they
+already use. The dial side is owner installed:
+`ConnectSettings.WebRtcExtenderCarrier` is a `WebRtcExtenderCarrier` the
+owner built with a resolver from an extender's identity key to its
+signaling; nil, the default, leaves a webrtc profile undialable. One
+carrier holds one peer connection factory, so its sessions share one
+certificate and inherit the STUN pool and the dtls mimicry of S4. A
+detached pion data channel is message oriented and a short read loses the
+rest of a message, so the stream adapter takes whole messages into a
+buffer sized to the advertised maximum and serves them out, cuts writes
+into 16 KiB messages (the size every implementation accepts), reports a
+passed deadline as the `net.Error` timeout every `net.Conn` does (net/http
+asserts exactly that on the read it interrupts at a hijack, and cancels
+the request context -- the extender's forward -- when it is not), and on
+close waits, bounded by 5 s, for what it wrote to be acknowledged before
+it closes the peer connection, since that close aborts the association and
+drops what is in flight; a dead association, which never acknowledges and
+which nothing on the peer connection reports, ends the wait through a
+read that fails at once. Not built for js/wasm: the browser owns webrtc
+there (stub). The sdk turns it on by default on both sides (S6, S8, owner
+2026-11-11): the role answers on the provider client's manager and a device
+dials through it; connect's own defaults leave it off (the directory gate,
+no carrier on `DefaultConnectSettings`), and connectctl serves it on
+`--webrtc`.
+
+S2. Signaling. The rendezvous rides the `ExchangeSignals` frames the p2p
+transport negotiates with, routed by the exchange to the extender's client
+id, under a new `extender_carrier` flag (field 5, additive): a flagged
+offer is for an extender and never for a transport peer connection, so the
+manager routes it, before its keyed lookup, to the answerer the extender
+role installed (`WebRtcManager.SetExtenderCarrierAnswerer`); a receiver
+that predates the flag sees an offer for a stream it has no peer connection
+for and drops it, which is how an old extender declines. An answer gathers
+candidates, which is seconds, so offers are answered on a bounded worker
+pool (`WebRtcSettings.ExtenderCarrierAnswerConcurrency`, 8) and never on
+the signal receive worker; past the bound an offer is dropped and counted.
+The answer is sent back on the companion of the dialer's contract exactly
+as a passive p2p peer replies. The dial side
+(`WebRtcManager.ExtenderCarrierExchanger(extenderClientId)`) allocates a
+stream id, sends the offer and waits for the answer under that id, bounded
+by the caller's context and the manager's life. The carrier trickles
+nothing: an offer and an answer each carry their gathered candidates.
+`ExtenderCarrierSignalingStats` counts what was declined, dropped, unknown
+or failed.
+
+S3. Records, directory, strategy. `ExtenderRecordBody.WebRtcClientId`
+(field 14, additive) is the client id the extender's device is reachable
+under on the exchange, which the operator signs from `network_extender.
+client_id` when an address of the record lists the webrtc carrier -- no
+migration; the stored `carriers` of an address already says which required
+path it passed. A record's address may list "webrtc" beside the socket
+carriers; the directory keeps it only while the owner has enabled the
+carrier (`ExtenderDirectorySettings.WebRtcCarrierEnabled`, off by default,
+`SetWebRtcCarrierEnabled` at run time) and the record carries the
+rendezvous id, since a webrtc dial with no signaling path can only fail
+and a failure counts against the address's other carriers.
+`ExtenderDirectory.WebRtcClientId(publicKey)` is the lookup a device's
+resolver signals by. With the carrier enabled the strategy expands a
+webrtc dialer per candidate that lists it through the mode dispatch it
+already has: `extenderConfigsForCandidate` (net_http.go) gives the webrtc
+config the tcp default port as its request authority only, no outer name
+and no tcp shaping, and `extenderDialerPriority` puts it after dns (130),
+as `orderedExtenderCarriers` orders it for the feed and the probes (S8).
+A failed webrtc dial holds only an address that serves no socket carrier
+(`ExtenderDirectory.RecordFailure`, S8).
+
+S4. Fingerprints. The STUN pool: ten high-collateral servers
+(`defaultStunServerUrls`), a random `IceServerSampleCount` (3) of them
+offered per manager-scoped factory, `IceServerUrls` as the pinned
+override. The dtls hello: `WebRtcSettings.DtlsClientHelloMimicry` replays
+a real browser webrtc ClientHello from the covert-dtls corpus (MIT,
+github.com/theodorsm/covert-dtls) on the SDP answerer, which is the dtls
+client and the side that sends the hello -- on this carrier the extender --
+rotating the fingerprint per peer connection, with the live random, session
+id and cookie spliced in so the handshake completes. Off by default on the
+direct p2p transport, on by default for the carrier
+(`DefaultWebRtcExtenderSettings`). No-op on js/wasm.
+
+S5. Acceptance and uptime on the operator (C2a, C3), server. An activation
+may offer "webrtc" among its carriers and must offer tcp or webrtc. The
+webrtc path is proved only where the tcp path failed or was not offered
+(owner, 2026-11-12; S8). Each required path that runs is proved on its own,
+the challenge on its carrier and then the verified `GET /hello` through it,
+with the family check of A7 per path; a path that fails is left out, and the
+activation is refused only when every required path that ran failed, with
+each failure named. An
+optional carrier (quic; dns per port) is probed when offered and left out
+when it fails, never refusing an activation a required path passed -- the
+two activation tests that asserted the old refusal now assert the drop.
+The stored carriers are the ones that passed, in the order offered; the
+record carries them and the rendezvous. The webrtc test runs connect's
+`ProbeExtenderWebRtcForward` over a carrier signaled through the relay of
+S8 (the operator's probe settings, `newExtenderWebRtcProbeConnectSettings`
+in the server's extender_webrtc_controller.go); the uptime probe runs
+`ProbeExtenderWebRtcCarrier` the same way. Uptime probes an address over
+the required path it was accepted on: the tcp challenge when the address
+lists tcp, and the webrtc challenge when it lists webrtc -- in place of tcp,
+once tcp has failed, when it lists both (S8) -- so an address is live while
+any required path it was accepted on answers and
+a webrtc-accepted extender is never deactivated for a public tcp port it
+may not have (`NetworkExtenderProbeTarget.ClientId`, read from the
+extender row).
+
+S6. The role (G2), sdk. `DeviceLocalSettings.ProvideExtenderWebRtc`
+(default on since S8, owner 2026-11-11; gomobile and the c abi json carry
+it) turns the carrier on
+for the provider extender role; the role needs a manager to signal through,
+the provider client's (`deviceLocalExtenderSettings.SignalingManager`),
+and installs its answerer on it when it starts serving, removing its own
+when it closes (S8). With the carrier available a role that cannot bind tcp 443
+runs anyway: the udp carriers bind, the server lists webrtc, the
+activation offers it, and the tcp bind failure is one more carrier's in
+`ListenError` rather than the role being off; `tcp_unavailable` applies
+only when the webrtc path is also unavailable, which is the setting off or
+no manager. `ExtenderProvideStatus.WebRtcCarrier` says the carrier is
+served. The port is tried again only by the role's next start (a provide or
+setting change), not every three minutes as the off role tries it.
+
+S7. Tests, every one in process and deterministic (barriers, injected
+signaling, pion's virtual network -- a WAN with the dialer and a LAN behind
+an endpoint-independent NAT with the extender, no STUN, so the join is the
+extender's own check crossing the NAT and the dialer learning the mapped
+address). connect: the stream adapter's root causes
+(`net_extender_webrtc_conn_test.go`: a short read keeps the rest of a
+message, which is the abort the first carrier draft died of; writes split
+at the bound; an oversized message is refused, not skipped; deadline errors
+are net timeouts; a close drains to acknowledgement, gives up on a dead
+association and waits past the peer's half-close); the carrier
+(`net_extender_webrtc_test.go`: the round trip behind the NAT with the
+challenge, the forwarded hello and the ICE pair addresses on both sides;
+no carrier; no signaling path; another key published or signed; a dial
+that brings no challenge still challenges; 403 and 429 carried as the
+typed refusals; the caller's context; another data channel label reset;
+an unopened answer released; a closed carrier); the signaling
+(`net_extender_webrtc_signal_test.go`: a flagged offer answered through
+the bridged exchange path, declined without an answerer, bounded,
+an answer nobody waits for, p2p offers left to the peer connections, a
+failed answer, the manager closing, and the whole rendezvous over the
+bridged path behind the NAT); the directory gate and lookup and the
+strategy's webrtc dialer (`net_extender_webrtc_directory_test.go`); the
+real server over the carrier (`extender/extender_webrtc_test.go`: the
+served stream with the https forward on the ICE pair's family, the two
+probes, a forward off the whitelist refused, admission by the ICE remote
+address, the carrier listed only when enabled and a server up on it
+alone). server: accepted on webrtc alone, on webrtc in place of a tcp
+path that failed, on tcp with webrtc untested when tcp passes, refused when
+neither passes and without a required path, the optional drops, the
+record's rendezvous (`controller/extender_webrtc_controller_test.go`,
+`extender_activate_webrtc_test.go`, the two rewritten tests in
+`extender_controller_test.go`), and the uptime task judging a webrtc
+address over webrtc through more ticks than the budget, probing a dual path
+address over webrtc only once tcp failed, never signaling a tcp address,
+and deactivating a webrtc address that stops answering
+(`taskworker/work/extender_probe_webrtc_work_test.go`). sdk: a role with
+tcp 443 taken running on the carrier, offering it, reporting the bind
+failure beside the others, installing and removing its answerer; staying
+off without a signaling manager; offering the carrier beside tcp
+(`device_local_extender_webrtc_test.go`).
+
+S8. Built (2026-11-11, owner: "yes this is what we decided, let's do it"),
+on branch `feat/extender-webrtc-s8-1111` in connect, server and sdk, held
+for the owner's release timing. Before it, an api process had no path to
+the exchange resident holding an extender's client, the seam of S5 answered
+nothing, and every webrtc test was refused.
+
+- The relay (server). The prober -- the api's activation, the taskworker's
+  uptime task -- adds one offer item (request id, its deadline, the SDP
+  offer json) to `{<clientId>}w_offer`, a Redis set whose size is bounded
+  at the add (2) and whose ttl each add renews
+  (model/extender_webrtc_relay_model.go), and then wakes the exchange
+  process holding the client's resident: it publishes the client id on that
+  process's own sharded channel, `extender_webrtc_offer_<host>_<service>_<block>`,
+  named by the resident's registration (`ncr_<clientId>`). Each exchange
+  process subscribes to its own channel alone, from its first resident on
+  (connect/extender_webrtc_offer_wakes.go, `server.RunRedisShardSubscription`,
+  which follows the channel's slot), so no process matches a pattern against
+  the keyspace notification of every set on Main (owner, 2026-11-12; S9). A
+  wake kicks the relay listener of that client's resident, which every
+  resident registers beside its close-request listener and which takes once
+  at registration (connect/extender_webrtc_relay.go); every start of the
+  subscription kicks every listener, trickled over the resync spread, since a
+  wake published while the process had no subscription is gone. The
+  listener holds no goroutine while idle, since every resident builds one.
+  It takes each offer once (SPOP),
+  and relays it the way a peers update reaches the client: the resident's
+  internal client, whose id is the control id, sends the flagged
+  `ExchangeSignals` through `WebRtcManager.ExtenderCarrierExchanger` and
+  waits under the offer's stream id for this client's answer alone. The
+  control id is a no-contract peer of every client, so neither direction
+  needs a contract, and the answer reaching the resident's controller is a
+  no-op there (`ConnectControlFrames`). The answer, or why there is none
+  (expired, oversized, malformed, rate_limited, busy, no_answer), is pushed
+  onto `{<clientId>}w_answer:<requestId>`, which the prober waits on with
+  BLPOP within its probe budget, cut to the whole seconds Redis waits; the
+  offer expires when the wait ends, and an offer no resident took is
+  removed. `urnetwork_extender_webrtc_relay_offers_total{outcome}` counts
+  the relay.
+- Not an open relay, not an amplifier. Only the prober originates offers,
+  and only for an extender it is testing: the activation for the client its
+  jwt names, once every check that refuses without a probe has passed and
+  its budgets are spent, and the uptime task for an address it probes; no
+  route takes a client id to signal. A resident relays only offers from its
+  client's own set, which only the prober writes, and only to that client.
+  Offers and answers are bounded at 16 KiB, a client's offers at 12 a
+  minute with a burst of 4, an exchange's relays at 64 at once, an
+  exchange with the client at 15 s (`ExtenderWebRtcRelaySettings`); a
+  refusal is answered, so the prober stops waiting. The prober's ICE
+  checks go only to the answer's candidates on the address being tested --
+  the activation's source address, the caller ip, or the address an uptime
+  probe judges -- by its /32, or by the /64 of an ipv6 one, as the
+  attribution rule matches an extender's address
+  (server model/network_extender_address_cache.go); every other candidate is
+  dropped before the answer applies, so before any check, and of those kept
+  at most 8 are, and connect's filter keeps them off the operator's own host
+  and links (`ExtenderWebRtcProbeSettings`; owner, 2026-11-12). A
+  peer-reflexive candidate Pion learns from a check that reaches it is still
+  answered at the address the check came from, as STUN answers; such a
+  check needs the ICE credentials of this probe's answer, and lives only as
+  long as the probe.
+- Acceptance (server, C2a). An activation must offer tcp or webrtc. The
+  webrtc test runs only where the tcp path failed or was not offered, never
+  beside a tcp test that may still pass (owner, 2026-11-12): an extender the
+  operator reaches on tcp is accepted on tcp, its device is sent no offer,
+  and webrtc is neither stored for it nor listed in `refused_carriers`. One
+  that offers tcp without webrtc is judged exactly as before, under the
+  whole 10 s budget. One that offers webrtc without tcp runs the webrtc test
+  under the whole budget. One that offers both runs the tcp path first, its
+  challenge cut at 5 s (`ExtenderActivateSettings.TcpChallengeTimeout`) --
+  a host behind nat that binds tcp 443 black-holes the challenge, which would
+  otherwise wait out the budget the webrtc test needs -- and when the tcp
+  path fails, at the challenge or after it, the webrtc test runs in its place
+  under a 10 s budget of its own that ends no later than 15 s after the
+  judging began, the uptime probe's address budget; the optional carriers
+  start once a required path passes, under that path's budget. The webrtc
+  test is one dial: the carrier challenges the
+  extender and verifies its key, then the verified `GET /hello` runs
+  through it, then the family check; a carrier probe and a forward probe
+  would be two signaling round trips and two ICE joins in the one budget.
+  The probe's ICE gathers on the activation's family alone
+  (`WebRtcSettings.IceIpVersion`), since the extender's forward follows the
+  family of the pair it was reached on (A7). An activation is refused only
+  when every required path that ran failed, each failure named, at the
+  webrtc step; a tcp path that failed where the webrtc test then passed is
+  listed in `refused_carriers` with its failure. The stage and step `webrtc`
+  join the activation metrics. The record carries the rendezvous (S3).
+- The cap (server). The operator accepts at most
+  `ExtenderActivateSettings.MaxWebRtcOnlyExtenders` extenders on webrtc
+  without tcp, 100 at first (owner, 2026-11-12): active extenders with an
+  active address that lists webrtc and not tcp
+  (`model.ExtenderAddressWebRtcOnly`, `CountActiveWebRtcOnlyNetworkExtenders`),
+  the activating key's own left out, so an extender already counted
+  activates again. The cap is read just before a webrtc test would run;
+  past it the test is not run, the extender's device is sent nothing, and
+  the activation is refused naming the tcp failure and the cap: "the webrtc
+  carrier was not tried: the operator accepts no more extenders on the
+  webrtc carrier without tcp for now (100 accepted, the cap is 100); an
+  extender whose tcp port the internet reaches is accepted on tcp". It is
+  counted as `urnetwork_extender_activations_total{stage="webrtc",outcome="cap"}`
+  (a cap that cannot be read refuses as `error`), and the population as
+  `urnetwork_stats_webrtc_only_extenders`, beside the relay on the extenders
+  dashboard. Each such address costs every uptime pass a relayed offer and
+  an ICE join at the same probe concurrency (16), and one whose test fails
+  holds a worker its 15 s; a hundred extenders, up to two hundred addresses,
+  hold the workers about three minutes of a pass if every one fails. The
+  bound is soft by the activations in flight at once.
+- Never the bootstrap. An address accepted on webrtc alone is in no geo dns
+  set and no seed cohort, and an extender with no socket address is never
+  sampled for an activation's bootstrap (`model.ExtenderAddressFirstContact`):
+  those are a client's first contact, and the carrier signals through an
+  exchange connection a client in first contact does not have. Its records
+  reach connected clients through the drip and the feed.
+- Uptime (C3). An address is probed over the required paths it lists, live
+  while either answers. One that lists both -- which an activation no
+  longer stores, since webrtc is tested only where tcp failed -- is probed
+  over tcp first, its challenge cut at 5 s (the address budget less the
+  activation's, `ExtenderProbeTcpBeforeWebRtcTimeout`), and over webrtc only
+  once tcp has failed, under the rest of the address budget; the two never
+  run at once. So a tcp port that stopped answering does not starve the
+  webrtc probe of the address budget, and a tcp port that answers sends the
+  extender's device no offer.
+- The device's dial side (connect, sdk). `WebRtcExtenderDialSignaling` holds
+  the client a device signals through, resolves an extender's key to the
+  rendezvous id of its verified record and that client's exchanger (never
+  to the device's own client), and opens the directory's gate exactly while
+  a client is set. The sdk installs a carrier with it on every space's
+  strategy settings but a hosted space's, and the device's provider client
+  sets itself as it is built and clears itself as it closes. A failed webrtc
+  dial holds only an address that serves no socket carrier
+  (`ExtenderDirectory.RecordFailure`): the join fails for reasons of the
+  path between the two ends, which say nothing of the extender's tcp, quic
+  and dns. The dialer comes after dns (S3). On a phone the dial carrier's
+  SCTP buffers are bounded to the device's p2p budget through its settings
+  (owner, 2026-11-12): each dial's receive window is the 128 KiB window
+  every p2p connection of the device takes (`deviceLocalP2pReceiveBufferByteCount`),
+  and its largest message fits it, where the carrier's defaults follow the
+  process memory target, 256-512 KiB (sdk
+  `applyMobileExtenderWebRtcDialSettingsForPlatform`); a desktop keeps the
+  carrier's defaults.
+- The role (sdk). `ProvideExtenderWebRtc` is on by default (S6). A role
+  removes only its own answerer as it closes
+  (`WebRtcManager.RemoveExtenderCarrierAnswerer`), so a successor's stays.
+  A role that started on the carrier without tcp 443 has no tcp carrier to
+  lose, so it is not replaced every three minutes for one.
+- Operators that predate the carrier. Such an operator's carrier check
+  refuses a list naming webrtc, `unknown carrier "webrtc"`, before it
+  probes or spends anything. The activator then posts the same list again at
+  once without the carrier and leaves the carrier off for that operator for
+  its life (`ExtenderActivator`), so the miner's other operators, and an api
+  not yet deployed, still activate the socket carriers; a host serving
+  webrtc alone is held for its carriers there, as before.
+- connectctl. `connectctl extender --webrtc` connects a client under its
+  client jwt to `--connect_url` and answers on its manager; the server lists
+  the carrier and a run without a tcp bind serves on it. That client
+  provides to its own network only, so the operator's probes and the
+  network's own devices reach it, and devices of other networks, whose
+  signals ride a contract to it, do not; the owner accepted that for a test
+  tool (2026-11-12).
+- Deploy order. The connect service first (the residents' listeners and
+  each process's offer channel), then the api, alt (which mounts the api router) and
+  the taskworker (the prober), and only then the clients and the miner,
+  through the nightly's sdk, whose role offers the carrier by default: an
+  api that predates it answers each role's first post of each family with
+  the unknown-carrier refusal above, one round trip lost per role. An api
+  ahead of the connect processes finds no subscriber on the channel its
+  wake goes to: the offer expires, the webrtc test fails as it did before,
+  and tcp is unaffected. No migration, no services version, no rpc version.
+  The monitor's relay signal (below) reads unobservable until the connect
+  service exports the relay counter.
+- Monitoring (server monitor, SIGNALS.md §28.6, owner 2026-11-12). The
+  relay's outcomes over the trailing hour, fleet wide: no_answer above half
+  of at least 20 offers for 30 minutes is `extender-webrtc-relay-no-answer-high`
+  (the clients' answerer or the relay path is broken), busy above 5% of at
+  least 20 for 30 minutes is `extender-webrtc-relay-busy-high` (the
+  exchange's 64 relays at once are full), and no relay series is
+  `extender-webrtc-relay-unobservable`. First values, to be revisited after
+  the first week of data.
+- Tests. connect: the gate and the resolver of the dial signaling, an offer
+  resolved through it reaching the extender over the bridged signaling, the
+  dialer's port, outer name, shaping and priority, the directory's failure
+  rule, the pinned ICE family (the network types; Pion's gathering under
+  them on loopback behind the `urnetwork_webrtc_loopback` build tag), the
+  answerer removal, connectctl's flags and a run serving on the carrier
+  alone. server: the acceptance rule over fake
+  probes on a fake clock (webrtc alone; no webrtc test beside a tcp path
+  that passes, a slow challenge within its share included; webrtc in place
+  of a black-holed challenge, cut at 5 s, with a 10 s budget of its own and
+  the optional carriers under it; webrtc in place of a failed forward; the
+  15 s bound after a forward that waited out the budget; neither, one after
+  the other; the webrtc failures as counted stages; a panic contained; no
+  webrtc test without the offer), the cap (refused untried past it, nothing
+  probed for webrtc alone, never asked when tcp passes, the test below it,
+  an unreadable cap; the count against the database), the prober's exchanger
+  over a fake relay (the wake on the resident's channel after the add, the
+  candidates kept to the tested address and its ipv6 /64), the listener over
+  a fake store and exchange (every refusal, the client's burst, the
+  exchange's slots, no worker while idle, the close), the offer channel's
+  wakes over a synthetic shard socket (subscribed with the first listener,
+  every listener kicked at a start, a wake kicking the named client alone),
+  no keyspace pattern for offers, the control no-op, the uptime paths (webrtc
+  only once tcp failed, on the bubble's clock), the monitor's §28.6 classes,
+  and against the test Redis and database the relay keys, the first-contact
+  rule and the relay end to end through a real exchange to a real client's
+  answerer. sdk: the default, the role on by default with the provider
+  client's manager, on the carrier without tcp 443, off without a manager, a
+  successor's answerer kept, a device's dials signaling through its provider
+  client, and a phone's dial window.
+
+Not done: a field proof (the carrier has not run between real home nats
+and the operator's hosts); a TURN fallback for the symmetric NATs hole
+punching cannot cross. UPnP-IGD, NAT-PMP and PCP port mapping, which lets
+today's socket carriers activate on many home routers, is built (S10).
+The apps need no setting for `ProvideExtenderWebRtc`, which is on by
+default. A device's signals to an extender ride an ordinary contract to the
+extender's client (S2), so an extender whose provider does not provide
+publicly, or a device out of balance, cannot be signaled; the owner accepted
+this for v1 (S9).
+
+S9. Decisions. The flag on `ExchangeSignals` rather than a new message
+type: the frames already reach the manager through the client's signal
+dispatcher, old receivers drop a flagged offer harmlessly, and nothing new
+has to be registered on the wire. The carrier dispatched before the header
+is built: with no outer leaf the dial must own the challenge. The shared
+request after the handshake (`extenderStreamRequest`): one A3 exchange for
+tcp and webrtc, so the server's refusals, limits and framing cannot
+diverge. The directory gate rather than a dial-time check: a webrtc
+candidate with no signaling path is never expanded; and a failed webrtc
+dial holds only a webrtc-only address, since a hold is of the whole
+address. The answerer on the manager rather than a second signal receiver:
+one receive path, one ownership. Uptime over every required path an
+address was accepted on, webrtc only once tcp has failed rather than both
+at once: an extender accepted on both is live while either answers, and a
+device whose tcp port answers is not sent an offer every five minutes for
+nothing. The relay on per-client Redis keys (S8) rather than the
+close-request set: an old connect process, which would take a close set's
+items and ignore an offer, never sees one. BLPOP for the answer on the
+ordinary Redis pool rather than the deadline pool, whose eight connections
+a node serve admission and the liveness lease. One dial for the
+activation's webrtc test and the ICE family pinned rather than the family
+check relaxed. Webrtc never in what a client reaches the operator by.
+
+The owner's review of S8 (2026-11-12) settled eight more, all built on the
+same branch:
+
+1. The webrtc test runs only where the tcp path failed or was not offered,
+   never beside a tcp test that may still pass, in the activation and in
+   uptime. The tcp challenge's 5 s share (rather than the whole budget)
+   keeps a black-holed port from leaving webrtc no time, and the webrtc
+   test then has a budget of its own, so the activation probes at most
+   15 s; `refused_carriers` lists the tcp path that failed where webrtc
+   passed, and never an untested webrtc (S8).
+2. A device's signals to an extender ride an ordinary contract from the
+   device to the extender's client (S2): accepted for v1. So an extender
+   whose provider does not provide publicly, or a device out of balance,
+   cannot be signaled over webrtc; the device's other carriers are
+   unaffected, and so are the operator's probes, which signal from the
+   control id, a no-contract peer of every client (S8).
+3. A phone's dial carrier takes the device's p2p budget through its
+   settings: a 128 KiB SCTP window per dial (S8).
+4. `connectctl extender --webrtc` reaching only its own network is fine
+   for a test tool; no change.
+5. A dedicated pub/sub channel wakes the exchange rather than the keyspace
+   notification pattern `{*}w_offer`, which made every exchange process
+   match the notification of every set on Main: one sharded channel per
+   exchange process, named by the residents' registrations, which follows
+   its slot and resubscribes (`server.RunRedisShardSubscription`). The
+   2-pending cap, the ttls, the size bounds and the answer list are as they
+   were. A wake is advisory, which the keyspace event was too: one lost to
+   a resubscribe is made up by the take every listener makes when the
+   subscription starts, and one that goes to a process the client's
+   resident has just left, by the take the resident's new registration
+   makes when the offer was added before it; an offer nobody takes expires
+   with its prober's wait, and the next probe tries again.
+6. A cap on extenders accepted on webrtc without tcp, 100 at first, with
+   its refusal and its metrics (S8); `ExtenderProbeConcurrency` stays 16.
+7. Monitor alert classes on the relay's no_answer and busy shares
+   (SIGNALS.md §28.6).
+8. The prober's ICE checks go only to the answer's candidates on the
+   tested address -- its /32, or the /64 of an ipv6 address, the
+   attribution rule's prefix -- and every other candidate is dropped before
+   any check (S8).
+
+S10. Router port mapping (built 2026-11-11), connect and sdk. A provider
+extender behind a home router has no inbound path on its carriers unless the
+router forwards them, so the role can ask it to. Owner, 2026-11-11: "make it a
+configurable option. the miners can turn it on by default, but the apps should
+turn it off by default." The setting is the sdk's
+(`DeviceLocal.GetProvideExtenderPortMapping`, `SetProvideExtenderPortMapping`,
+on the `Device` interface and through `DeviceRemote`'s rpc), stored per space
+as `.provide_extender_port_mapping`; until the user sets it the device default
+applies, `DeviceLocalSettings.DefaultProvideExtenderPortMapping`: off in
+`DefaultDeviceLocalSettings`, so off on every app (macOS, Windows and Linux
+carry the switch, "Open a port on my router", under the speed tests switch, and
+its description says it opens a port on the router; Android and iOS carry no
+role), and on in the sn miner (`miner.ProviderDeviceSettings`), which
+`URNETWORK_PORT_MAPPING=0` and `provide --no-port-mapping` turn off and
+`provider status` and `provider doctor` report. A changed setting replaces a
+running role, so off removes what the router forwards.
+
+`connect/portmap` asks the router of the host's ipv4 default route, read with
+go-netroute (BSD-3-Clause): PCP (RFC 6887) first, NAT-PMP (RFC 6886) when the
+server answers the PCP request with its own version, then UPnP IGD through
+goupnp (BSD-2-Clause) for the description and the SOAP actions. PCP and
+NAT-PMP are implemented in the package, a few hundred lines with their wire
+formats tested byte for byte: the one NAT-PMP library, jackpal/go-nat-pmp, is
+Apache-2.0, and no MIT or BSD PCP library exists. The first method that maps
+the tcp carrier is used for every carrier; a method that maps only the udp
+ones is undone and the next is tried. Mappings ask for an hour, renew at half
+the lifetime granted (at least a minute apart), and a mapper that maps nothing
+asks again after five minutes, doubling to an hour. Every exchange is bounded:
+three PCP or NAT-PMP sends from 250 ms, a 1.5 s SSDP search, 2 s per UPnP
+request, 10 s for a whole attempt, 3 s to remove everything.
+
+What it may map is narrow. The role asks only for the carriers it holds once
+its binds settle -- tcp 443, and udp 443 and udp 4053 when they bound -- never
+a port it does not hold, since the router would forward it to whatever does,
+and never udp 53. Every mapping forwards to this host's own address. Only the
+gateway is talked to: a PCP or NAT-PMP answer from another source is dropped,
+the SSDP answer must come from the gateway's address, and a UPnP description
+or control url off the gateway is refused, so another device on the lan can
+neither steer a mapping nor make the host request anything elsewhere; the
+http client uses no proxy and follows no redirect. A UPnP router that grants
+only permanent leases (725) is not used, since a mapping that outlives a
+crashed process would later forward to whichever host takes the address. A
+router whose own external address is private or CGNAT is behind another NAT,
+which nothing on it crosses: its mappings are removed and the attempt fails. A
+host with a public ipv4 address maps nothing (`connect.FamilyPublic(4)`), and
+neither does a host whose default route is a tunnel (`connect.
+IsTunnelInterfaceName`), such as an app's own vpn while connected.
+
+The activation offers what the router forwards, to the family it forwards. The
+first post waits for the router's first answer at most 15 s, so a missing or
+broken router delays the first activation by that and nothing else; each ipv4
+post reads the external ports and each ipv6 post offers the bound ones, since
+only ipv4 is mapped (`ExtenderActivatorSettings.FamilyOfferedPorts` and
+`FamilyDnsPorts`, read per family at each post; a post to the plain api url,
+whose family the operator derives, offers the ipv4 ones); a mapping that lands
+or moves later is posted at once (`Reactivate`), and each family's mesh address
+uses the tcp port its post offered. A router may give an external port other
+than 443: PCP and NAT-PMP pick one, and an IGD:2 router answers a conflict (718)
+through AddAnyPortMapping; IGD:1's conflict fails the method. Only ipv4 is
+mapped; a v6 firewall pinhole (PCP or WANIPv6FirewallControl) is not done.
+
+Each address keeps its own ports (built 2026-11-12). The operator stores the
+tcp and udp ports each family's activation was probed on with that family's
+address (`network_extender_address.tcp_port` and `udp_port`, beside its
+`dns_ports`); the uptime and recovery probes dial an address on its own tcp
+port; the lag.dev measurement takes only the addresses that serve tcp on 443;
+and the signed record names an address's own ports where they are not the
+record's (`protocol.ExtenderAddress` `TcpPort`, `UdpPort` and `DnsPorts`,
+fields 4 to 6), which a client's candidate dials (`ExtenderDirectory`). The
+record's own ports stay the extender's latest activation's, so an address on
+them names none, and the record of an extender whose addresses share their
+ports is the record it always was. A reader that predates the fields skips them
+and dials every address on the record's, which is what it did before; an
+address activated before the operator kept its ports reads the extender's.
+Every answer of such an operator says so (`address_ports`,
+`ExtenderActivateResult.AddressPorts`), and a family's post offers its own
+ports only while the last answer did: until then, and to an operator that
+predates it, every post offers the one set of ports, the router's (the family
+seams asked for family 0), since an operator keeping one port per carrier would
+publish each family on the other's. The first post of a pass is the ipv4 one,
+so the ipv6 post of the same pass already offers its own. The order the
+operator and the extenders are deployed in does not matter.
+
+`ExtenderProvideStatus` reports it: `PortMapping` (off, not_needed, mapping,
+mapped, failed), `PortMappingMethod`, `PortMappingExternalIp`, the external
+`PortMappingTcpPort`, `PortMappingUdpPort` and `PortMappingDnsPort`, and
+`PortMappingError`, why nothing is mapped or why a udp carrier is not. The
+apps show `PortMapping` with `PortMappingMethodName` and `PortMappingPorts`,
+the method and the forwarded ports as one text in every language; never
+`PortMappingError`, whose router words can name an address. Tests,
+all in process: `portmap/` against a PCP and NAT-PMP server answered in memory
+and a UPnP IGD:1 and IGD:2 device on httptest, with a clock whose waits the test
+fires (the methods, the fallback, the router's external port, renewal at the
+granted lifetime and a moved port, the retry backoff, removal on close, the
+partial method undone, permanent leases, conflicts, double NAT, urls off the
+gateway, and every request naming only the caller's ports), and the real udp
+exchange and SSDP search on loopback; connect's
+`TestExtenderActivatorOffersTheMappedPorts`, and for the per-address ports
+`net_extender_address_ports_test.go` (the fields' wire numbers, an address
+without them encoding as before, a candidate on its address's ports and on the
+record's without them, each family's post offering its own ports, a carrier
+change compared per family); the sdk role at the device's entry points with a
+NAT-PMP router behind the mapper's seam (`device_local_extender_port_mapping_test.go`:
+off by default, the router's ports in every ipv4 post and ipv4 mesh address
+and the bound ones over ipv6, nothing asked with a public address, the mappings
+removed when the setting turns off and when the role stops, a moved mapping
+posted at once, the space's stored setting read by a device that starts
+later); the operator's record and measurement rule
+(server `controller/extender_address_ports_test.go`, with an activation of
+each family keeping its ports) and its storage, readers and probe targets
+(`model/network_extender_address_ports_test.go`); the miner's default, the
+environment, the flag and the status lines (`sn/miner/port_mapping_test.go`).
+
+### I. Tests
+
+Every phase ships tests with it. In-process fixtures only: the extender
+seams, an httptest operator, libp2p mocknet or in-memory transports for
+the mesh, a fake Route 53 publisher, a fake DoH forward, dual-stack
+loopback for family matching (tests run on dual-stack hosts and require
+v6), barriers rather than sleeps, synthetic names and RFC 5737 and
+RFC 3849 addresses only. Server tests run under the repo's test harness
+with the database.
+
+## 4. Wire and schema changes
+
+| Surface | Change |
+|---|---|
+| `protocol.ExtenderHeader` | `Challenge`, `Service` added |
+| `protocol.ExtenderResponse` | new |
+| `protocol.ExtenderAddress`, `ExtenderRecordBody`, `ExtenderRecord`, `ExtenderRevocationBody`, `ExtenderRevocation`, `ExtenderGossipMessage`, `ExtenderFeedRequest`, `ExtenderFeedFrame` | new |
+| extender tcp 443 | HTTP/1.1 inside TLS; v1 framing accepted one release |
+| extender udp 443, udp 4053 (and udp 53 on the sn miner) | new carriers, H3 inside QUIC |
+| `GET /hello` | `extender_root_public_keys` |
+| `POST /network/extender-activate` | new |
+| `network_extender`, `network_extender_address`, `network_extender_publish` | new tables |
+| Route 53 `extender.<host>` | geolocation A and AAAA sets |
+| gossipsub topic `/ur/extender/<host>/1` | new |
+| `sdk.NetworkSpaceValues` | `ExtenderDnsName`, `GossipUrl`, `ExtenderRootPublicKeys` added; `NetExtenderAutoConfigure` removed |
+| sdk local state | `.extenders`, `.extender_key`, `.provide_extender`, gossip mode |
+| `connect.ClientStrategySettings` | `ExtenderDirectory`, `ExtenderInitialSampleTimeout` added; `ExtenderNetworks`, `ExtenderHostnames` removed |
+| `network_client_connection` | `extender_id uuid NULL` |
+| `contract_extender` | new join table, zero to many per contract, source or destination party |
+| `connect.ProviderEvent` | `ExtenderIps` |
+| `sdk.ProviderGridPoint` | `ExtenderIps`, `ExtenderColorHexes` |
+| `sdk.ExtenderStatus` | `GossipState`, `EventCountLastMinute`; moves onto `Device` |
+| `sdk.NetworkSpaceValues` | `ExtenderHosts []string` |
+| `ExtenderShare` | new protobuf message, the QR payload |
+| `protocol.ExtenderRecordBody` | `DnsPorts` added, `DnsPort` kept |
+| `POST /network/extender-activate` args | `dns_ports` |
+| `sdk.NetworkSpaceValues` | `AltUrl` override; `GetAltUrl`, `GetAltUrlV4`, `GetAltUrlV6` |
+| `connect.PlatformTransportSettings` | `AltUrl` |
+| `services.yml` | `alt` service on the proxy hosts, external udp 443 and 4053; connect dns listener 4053 |
+| DNS | `alt`, `main-alt`, `alt-v4`, `alt-v6`, `main-alt-v4`, `main-alt-v6` per domain |
+| `network_extender` | `location_id`, `city_location_id`, `region_location_id`, `country_location_id` added, nullable |
+| `contract_extender` | `create_time` added with index `(create_time, contract_id)` |
+| `urnetwork_stats_*` | extender, family and contract gauges of M4 |
+| `stats.json` | extender and family fields of M7, optional to consumers |
+| `/stats/providers-map` | `extender_count` per region; regions with extenders only |
+| `grafana/dashboards/providers.json` | new internal dashboard |
+| `connect.ExtenderFamilyActivationStatus` | `LastRefused` added |
+| `sdk.ExtenderProvideStatus` | `Supported`, `State`, `ErrorCase`, `Reason`, `StartError`, `LastActivationRefused` added |
+| `sdk.Device` | `GetExtenderProvideStatus`, `AddExtenderProvideStatusChangeListener`, `GetProvideExtender`, `SetProvideExtender` added; mirrored on `DeviceRemote` |
+| `sdk.DeviceRemoteState` | `ProvideExtender` queued and last-known, applied at sync; the rpc version does not change |
+| `sdk.DeviceLocalSettings` | `DefaultProvideExtender` added, default on (F3, G1); `NewDeviceLocalWithProvideExtender` and the c abi `urnet_new_device_local_with_provide_extender` added |
+| localization keys | the extender row strings of N5 |
+| `extender.ExtenderServer` | `Stats()` and `ExtenderStats` (O1) |
+| `sdk.Device` | `GetExtenderStats` added; mirrored on `DeviceRemote` |
+| `sdk.ContractViewController` | `GetExtenderThroughputPoints`, `GetExtenderStats` added |
+| localization keys | the statistics strings of O6 |
+| `protocol.ExtenderHeader` | `HopCount` added (A11) |
+| `connect.ExtenderDial` | `HopCount` added; `connect.ExtenderRefusedError` for a non-200 answer and `connect.IsExtenderMemoryBudgetError` for a local budget refusal (A11) |
+| `extender.ExtenderSettings` | `NLayerHops`, `NLayerMaxDepth`, `NLayerDialTimeout`, `NLayerHoldTimeout`, `NLayerAttempts`, `NLayerClientHelloTimeout`, `NLayerHoldHandler`, and the test seam `HeaderHandler` added (A11) |
+| `extender.ExtenderServer` | `NLayerStats()` and `ExtenderNLayerHopStats` (A11) |
+| `protocol.ExtenderResponse` | `HopCount` and `ChainEndPublicKey` added (A11, GEOMAP §2.9) |
+| `connect.ExtenderLatencyProbe` | `HopCount` and `ChainEndPublicKey` added; `connect.ExtenderPingReport` gains `hop_count` (A11, GEOMAP §2.9) |
+| `connectctl extender` | repeatable `--nlayer-hop=<spec>` (A11) |
+| extender carriers | 429 with no body and a `Retry-After` for an action over an admission limit; a subnet past its refusals is closed at accept, before TLS (A12) |
+| `extender.ExtenderSettings` | `AdmissionSubnetsPerMinute`, `AdmissionActionsPerSubnetPerMinute`, `AdmissionRefusalsPerSubnetPerMinute`, `AdmissionRetryAfterMin`, `AdmissionRetryAfterMax`, `AdmissionIpv4PrefixBitCount`, `AdmissionIpv6PrefixBitCount`, `AdmissionMinSubnetCount`, `AdmissionUnlimitedSources`, `NLayerLimitedBackoff`, and the test seam `AdmissionNow` added (A12) |
+| `extender.ExtenderServer` | `AdmissionStats()` and `ExtenderAdmissionStats` (A12) |
+| `extender.ExtenderNLayerHopStats` | `LimitedCount`, `LimitedUntil` added (A12) |
+| `connect.ExtenderLimitedError` | new, for a 429, with the `RetryAfter` it carried; `connect.JitterExtenderLimitedBackoff` (A12) |
+| `connect.ExtenderDirectorySettings` | `ExtenderLimitedBackoff` added (A12) |
+| `connect.ExtenderDirectory` | `RecordLimited`, `AddressLimitedUntil` added; `ExtenderCandidate` and `ExtenderDirectoryEntry` gain `LimitedUntil` (A12) |
+| `connectctl extender` | `--admission_subnets_per_minute=<count>`, `--admission_actions_per_subnet_per_minute=<count>`, repeatable `--admission_unlimited_source=<cidr>` (A12) |
+| sdk native extender role | `AdmissionSubnetsPerMinute`, `AdmissionActionsPerSubnetPerMinute`, `AdmissionUnlimitedSources` on its settings (A12) |
+| `sdk.ExtenderProvideStatus` | `LimitedBySubnetsCount`, `LimitedBySourceCount` added (A12) |
+| `connect.ExtenderDirectorySettings` | `MaxActiveRecordCount` (512) and the test seam `Random` added; the default `MaxAddressCount` is 2048, was 512 (E6, D26) |
+| `connect.ExtenderDirectory` | `KeepPublicKey`, `SetMaxActiveRecordCount`, `MaxActiveRecordCount`, `ActiveRecordCount` added (E6, D26) |
+| `connect.ExtenderPeerPingerSettings` | `PeerSampleSize` (64) added (G5, GEOMAP §2.1) |
+| `connect.ExtenderPeerPingerStatus` | `SampleSize`, `SampledPeerCount` added; `ExtenderPeerPinger.SampledPeers` (G5) |
+| sdk native extender role | `PeerSampleSize`, `MaxActiveRecordCount` on its settings (G5, E6) |
+| `protocol.ExtenderRecordBody` | `RealityPublicKey` added (field 13), the 32-byte X25519 static key; signed, old readers skip it (P1, P6) |
+| `POST /network/extender-activate` args | `reality_public_key_hex`; unknown to old operators, so non-fatal (P6) |
+| extender tcp 443 | a browser ClientHello whose session id seals the client's proof (P1); an unauthenticated hello is spliced to the real borrowed site in splice mode, else terminated as today (P3); authenticated connections negotiate http/1.1 server-side (P4) |
+| `extender.ExtenderSettings` | `CamouflageEnabled` (default off), `ExtenderCamouflageSplice` (default off), `ExtenderCamouflageTimeWindow` (2 min), `ExtenderCamouflageReplayTagCount` (65536), `ExtenderCamouflageHelloMaxByteCount` (16 KiB), `ExtenderCamouflageSpliceMaxCount`, `ExtenderCamouflageSpliceMaxPerTarget` added (P1, P2, P3, P7) |
+| `extender.ExtenderStats` | authenticated/spliced/terminated tcp connection counts, replays refused, auth time-window failures, splice-target and borrow-verify failures (P7) |
+| connect root | `res/extender_borrow[_<cc>].bin`, a splice-friendly borrowed-names list in the spoof-resource form, bundled; the X25519 static-key HKDF derivation from the identity seed (P1, P5) |
+| `connect.ExtenderConfig` | the camouflaged tcp dial folds in as a camo-first-then-legacy staggered race on the existing tcp carrier, driven by `RealityPublicKey`; kill switch is the sibling branch's `ConnectSettings.TlsClientHelloFingerprint="go"` (P8) |
+| `sdk.DeviceLocalSettings` | `DefaultCamouflage` added, default following `DefaultProvideExtender` (P7) |
+| extender udp 4053 and udp 53 (dns carrier) | a request is one TXT question with no aa bit and an EDNS0 opt record (udp payload 1232); a response repeats the opt record only for a request that carried one (Q2); old peers unchanged in both directions (Q3) |
+| `POST /network/extender-activate` answer | `probe_steps` added; `refused_carriers` entries gain `elapsed_ms` and `budget_left_ms`; a probe refusal's `error` says how long its step ran, or how much budget it had; old providers skip the fields (C2b) |
+| api metrics | `urnetwork_extender_activations_total{stage, outcome, family}`, `urnetwork_extender_activation_step_seconds{step, outcome}` (C2b) |
+| `extender.ExtenderSettings` | `ForwardDialTimeout` (5 s) added; `ExtenderErrorStageForwardDial`, `ExtenderErrorStageDatagramForwardDial` exported (A7) |
+| sdk native extender role | logs forward dial failures at most once a minute per kind, `ForwardDialErrorLogInterval` on its settings (G2) |
+| `extender.ExtenderSettings` | `AcceptRetryMinBackoff`, `AcceptRetryMaxBackoff`, `AcceptDownTimeout`, `CarrierRebuildMinBackoff`, `CarrierRebuildMaxBackoff`, `CarrierRebuildStableTimeout` and `CarriersChangeHandler` added; `ListenErrorHandler` also receives what ended a carrier that was serving (G2) |
+| `extender.ExtenderSettings` | `ErrorHandler` hears a stage's name and a class of failure, and the whole error only of the four dial stages, of which `ExtenderErrorStageNLayerHopDial` and `ExtenderErrorStageNLayerProbeDial` are added; a site's error text no longer names an address, a host or a query name (G2) |
+| `extender.ExtenderServer` | `Carriers` and `DnsPorts` read what is serving now, and nothing once it has ended; `Done` added (G2) |
+| `ExtenderActivator` | `TcpCarrierReturned`, `CarriersChanged` and `State` added, with the settings `CarrierReturnJitter`, `PreviousState` and `ReplacedPostJitter`; no post without a required carrier (G2, G3) |
+| packet translation, server modes | a datagram that cannot be written, or on windows is too long to read, is lost, however long that goes on; a temporary read error is waited out; a closed socket or any other read error ends it; `EndError` added; no socket error it logs, keeps or returns names an address (G2) |
+| `sdk.ExtenderProvideStatus` | `Listening` is the tcp carrier serving; `ListenError` also carries what ended it, and no family reads as activated meanwhile (G2, N3) |
+| `POST /network/extender-activate` answer | a key another network holds is refused with the fixed `error` of C2c and no `retry_after_seconds`; old providers read it as any refusal (C2c) |
+| api metrics | stage `owner` on `urnetwork_extender_activations_total` (C2b, C2c) |
+| alt api front and status listener | `X-UR-Forwarded-For` set from the peer; `X-Forwarded-For`, `X-Forwarded-Source-Port` and `X-UR-Request-Buffering` cleared (L1) |
+| `protocol.ExtenderAddress` | `TcpPort`, `UdpPort` and `DnsPorts` added (fields 4 to 6): an address's own ports where they are not the record's; zero and empty take the record's, and a reader that predates them skips them (S10) |
+| `ExtenderActivatorSettings` | `FamilyOfferedPorts` and `FamilyDnsPorts` added, read per family in place of `OfferedPorts` and `DnsPorts`, for family 0 while the operator keeps no address ports (S10) |
+| `POST /network/extender-activate` answer | `address_ports` added: the operator keeps each address's ports; old providers skip it (S10) |
+| `network_extender_address` | `tcp_port` and `udp_port` added, nullable; null is the extender's (S10) |
+
+Old clients keep working: the header's new fields are optional, the hello
+field is additive, the tables are new, and a v1 extender client still
+reaches a v2 extender for one release.
+
+## 5. Phases
+
+Each phase: the design section is the contract, the implementation lands
+with its tests, the whole package test suite of every touched module
+passes, and a review closes it before the next starts. Phases 2 and 3 are
+independent and may run concurrently in their separate repositories.
+Phase 5b follows 4 because both touch the server.
+
+1. Extender protocol v2 (connect root, `connect/extender`, protocol): A1
+   to A10, B1 to B3, `ProbeExtenderCarrier` and `ProbeExtenderForward`.
+   Acceptance: a client reaches an in-process operator through each of the
+   three carriers over v4 and over v6 with the forward on the matching
+   family; a v1-framed client still works on tcp; a plain HTTPS, h2 and H3
+   GET with a whitelisted SNI gets the reverse-proxied fixture site and a
+   non-whitelisted SNI gets 403; an extender request to a spoof domain
+   destination is refused; udp 53 non-translation queries are answered
+   from the fake DoH forward, ANY is refused, rate limits hold; the
+   challenge response verifies and a wrong key fails; the outer cert
+   verifies against the record key and a substituted chain fails; the
+   limits of A9 hold under a flood.
+2. Server: C1, C2, C3, C7 and the drip half of C4. Acceptance: activation
+   against an in-process extender stores the rows and returns a signed
+   record, bootstrap and allowed hosts; a failed carrier rejects; the rate
+   limit holds; probes deactivate after 6 failures and insert a
+   revocation; a re-activation issues a newer record; the drip rotates
+   oldest first and grows the batch under load; hello returns the keys.
+3. Client: E1 to E5, F1, F2, D5 role selection without the node (feed
+   role for every app in this phase). Acceptance: the directory policy
+   from E1 is pinned by tests for each transition; the strategy uses
+   directory candidates and reports outcomes; the store round-trips and
+   tolerates corruption; DNS bootstrap over an in-process DoH server
+   yields unverified entries that upgrade on a feed record; the startup
+   gate waits at most 2 s and never with a stored directory; the sdk
+   status and listener reflect every change; the env prefix rule for the
+   defaults; bindings regenerate.
+4. Route 53 publisher: C5. Acceptance: continent sampling, fill from
+   global, deletion of empty sets, one batch per tick, the fake publisher
+   records exact sets, configuration disabled leaves DNS untouched.
+5. Gossip. 5a (connect, sdk): D1 to D4, the member role, the feed server
+   on extenders, the gossip listener in `connect/extender`. Acceptance:
+   three extenders and a member on in-memory transports relay a signed
+   record and a revocation to every directory and reject a forged one;
+   the feed serves a sample and streams updates; the extender transport
+   dials through the tcp carrier and the upgrader authenticates the peer
+   id; the js build stays feed-only; the iOS size ceiling is measured and
+   raised as a reviewed change if needed. 5b (server, vault): C6 and the
+   gossip service. Acceptance: publish rows drain in order and are
+   stamped; the service reconnects; a second replica does not double
+   publish.
+6. Provider extender role: G1 to G4. Acceptance: a desktop provider binds,
+   activates over v4 and v6 against an in-process operator, appears in its
+   own directory, re-activates on an observed revocation and on an
+   address change, honors the opt-out, and skips bind failures silently;
+   connectctl extender runs the same path.
+7. Contract parties: J1 to J5 in the server, J4 in the sdk. Acceptance: a
+   connection from an active extender address is tagged and one from any
+   other address is not; contract, no-escrow and companion creation write
+   the source and destination parties, zero to many, the same extender on
+   both sides once per party; settlement pays an extender an equal hop
+   share, nothing on the payer's network, and once when it is also the
+   egress; the rows go with the contract; a public provider's transports
+   dial directly and a network provider's keep the extender dialers.
+8. App user interface: K1 to K8. 8a (connect, sdk): the extender ip
+   plumbing from dial to grid point, the color, the status on the device
+   and over rpc with the gossip state and event rate, the read-only store,
+   `ExtenderHosts`, the share payload and the view controller, bindings.
+   Acceptance: a provider reached through an extender carries that ip and
+   color on its grid point over a local and a remote device; the status
+   states and the event rate are pinned; a manual host resolves and unions;
+   a share round-trips with and without settings, refuses a foreign host,
+   and applies settings only when asked. 8b (one agent per app: android,
+   apple, windows, linux): dots with rings, the drawer panel, the account
+   section with settings, share and import per K8, localized strings.
+   Acceptance per app: rendering pinned by the app's existing view tests
+   where it has them, settings round-trip through the sdk, share renders
+   and import parses the sdk payload.
+9. The alt service: L1 to L5. 9a (warp, vault): external udp port
+   mapping for host-pinned services, the `alt` service entry on the proxy
+   hosts with udp 443 and 4053, the lb mapping unchanged. Acceptance: warpctl emits the DNAT for a host-pinned
+   service's external udp ports and nothing else changes for the lb. 9b
+   (server): the `alt` package and cli (exchange, connect handler without
+   H1, api router over http3, SNI dispatch, whodis listener, rate limits
+   from services.yml), `dns_ports` in activation with per-port probes. Acceptance: an in-process alt serves an
+   api call over H3 and over whodis and a platform transport session over
+   both, dispatching by SNI and refusing an unknown name; the limits from a
+   parsed services.yml fixture apply and excluded subnets bypass them; the
+   lb-fronted services enforce nothing. 9c (connect, sdk): alt urls, the
+   two api dialers with their priorities, the platform modes on alt,
+   `DnsPorts` on records and the 53-then-4053 dial order, the extender
+   listening on 4053 and 53 where allowed, connectctl and the provider role
+   following. Acceptance: the strategy reaches an in-process alt fixture
+   over h3 and whodis in the stated order; the platform H3 modes dial the
+   alt host and H1 the platform host; an extender advertising 4053 only is
+   dialed on 4053; records with both ports are dialed 53 first. (Revised
+   2026-10-06, L2: only the sn miner binds 53, and a client races 53 and
+   4053 on every extender, the record's ports first.)
+   Operations: the router DNAT of 53 to 4053 on the proxy hosts and the
+   DNS records of L3.
+10. Statistics and the map: M1 to M10. 10a (server): the two schema
+   changes, the model counts, the hour bucket cache, the collector gauges,
+   the map export, both dashboards and their tests, PUBLICSTATS.md. 10b
+   (warp): the feed fields and their tests. 10c (mmm/ur.io): the feed and
+   map parsers, the geometry helper, the globe rings and hover, the
+   headline and legend, the node tests. The gauge, feed and map field
+   names above are the contract between the three, so 10a, 10b and 10c
+   run concurrently. Acceptance: an activated extender carries its
+   location ids and appears in the by-country and family gauges and in
+   its region's `extender_count`; a dual-stack extender counts once as
+   dualstack; the contract gauges match inserted fixtures in both forms
+   and the bucket cache is consulted rather than rescanned; the feed
+   serves every new field and omits an unset one; the dashboards pass the
+   allowlist and coverage tests; the helper's areas are linear in the
+   counts and a ringed dot renders with the ring under it.
+11. Provider extender status and toggle: N1 to N7. 11a (connect):
+   `LastRefused` on the family activation status; (sdk, the refused case
+   after the connect half): the status fields, the error case and the
+   state rule with the start case, the `Device` interface and
+   `DeviceRemote` mirror with the queued setting and the last-known
+   value, the setting cache, the mobile stub, bindings; concurrently
+   (localizations): the keys of N5 generated into the apple, linux and
+   windows trees. 11b (one agent per desktop app: apple for macOS with
+   the row hidden on iOS, linux, windows): the row, the read-only row,
+   the tests, laid out as N7 specifies. Acceptance: the state rule is
+   pinned case by case with the case each error carries, and a refusal
+   and a request error render as distinct cases; a remote device reports
+   the local status and setting, an old service reports unsupported, and
+   a setting written while the device process is down is read back at
+   once and applied at the next sync; each desktop app renders every
+   state with its color and text from `State` and `ErrorCase` alone,
+   hides the row (never disables it) when unsupported, neither reads
+   the setting nor calls the setter while it is hidden, and writes the
+   setting through the device.
+12. Extender statistics: O1 to O8. 12a (connect): the counters and their
+   tests. 12b (sdk, after 11a and 12a): the device surface, the rpc
+   mirror, the series with the controller's latest stats beside it,
+   bindings; concurrently (localizations): the keys of O6. 12c (one agent
+   per desktop app, after 12b, carrying 11b as well so each app tree is
+   edited once): the extender section, and on Linux and Windows the
+   provider section it sits above, laid out as O8 specifies. Acceptance:
+   a relayed byte is counted once in the right direction with its read;
+   the series follows the counters, holds at zero when the role stops and
+   takes a restart as a gap; each desktop app shows the extender section
+   only with the provider one and a running role, keyed off the pushed
+   status, keeps both sections when its window shows again or a device
+   arrives instead of collapsing them while a new controller takes its
+   first samples, and Linux and Windows show the provider section as
+   macOS does.
+
+## 6. Known limitations
+
+- The bytes an extender relays, api and control traffic included, are
+  not measured. Extender pay comes from J2/J3 instead: each contract pays
+  every extender recorded on it an equal hop share. PROXY-protocol
+  attribution to a dedicated edge port is a later phase.
+- The reverse proxy answers probers behind a self-signed cert; an active
+  prober that validates certificates sees a misconfigured host, which is
+  the accepted posture. The camouflage splice (P3) closes this on the tcp
+  carrier in Phase B: an unauthenticated prober is spliced to the real
+  borrowed site and sees its real certificate. The self-signed posture
+  remains for the udp carriers (P9), for the tcp carrier in Phase A (the
+  migration default), and as the degraded fallback when no borrowed target
+  is reachable (P3).
+- Camouflage is a classifier defense, not an address defense. The borrowed
+  site is not hosted at the extender's address, so an extender on a home
+  address claiming a big-site name is an SNI-to-IP mismatch a censor can
+  catch by address (REALITY shares this); the borrowed-names list is curated
+  for names plausibly hosted anywhere to narrow it, not to erase it (P5), and
+  the directory stays enumerable regardless, so camouflage helps against a
+  censor that classifies traffic, not one that harvests addresses. The
+  mismatch is exploited, not theoretical: users reported China blocking
+  hundreds of REALITY server addresses on 4 to 12 March 2026, apparently
+  because the borrowed name did not belong to the server's address range
+  (community reports, not a published measurement).
+- The splice sends a prober's bytes to a third-party borrowed site from many
+  extender addresses; the per-subnet, per-connection byte, idle, total and
+  per-target bounds of P3 keep it bounded, and the posture is off by default
+  (P7) until an operator accepts it.
+- Camouflage is tcp only (P9). QUIC on udp 443 and the dns carrier stay
+  identifiable on the same address, and TLS-in-TLS detection applies to every
+  carrier, the camouflaged one included.
+- H3 to the operator is unavailable through an extender; the H1 websocket
+  runs inside the carriers.
+- Records lag reality by up to one drip rotation; the directory's local
+  failure policy covers the gap.
+- An extender behind NAT or without a public address never activates,
+  which the probe-back guarantees. It is no longer silent: the status says
+  the internet can't reach the device on tcp 443 and what to open or forward
+  (N3, `activation_unreachable`), and a family that has not activated is
+  posted once a day and on its triggers rather than on the backoff (G3,
+  2026-11-03), until the peer-to-peer webrtc test of C2a lands.
+- The spoof list ships empty until operations provide it, so extender
+  dialers appear only after that.
+- A client that never dials an unverified dns address has no extender at
+  all on an operator whose `extender.<host>` carries no TXT records, since
+  the feed is reached through extenders and dns is the only bootstrap. The
+  taskworker that publishes the TXT sets therefore deploys before the
+  connect change reaches clients, and an operator that removes its root
+  key strands every client that has not stored a directory.
+
+## 7. As built
+
+Phases 1 to 9 of section 5 are implemented and committed on branch
+`extender` across connect, server, sdk, sn, vault (services version v22
+and `extender.yml`), warp, build, localizations, android, apple, windows
+and linux, as of 2026-09-13. Each phase's refinements are recorded inline
+above. Nothing is pushed.
+
+Verification at the end, on the final trees: connect `go test ./...`
+green (about ten minutes, run with a 30 minute timeout); sdk full suite
+green except `TestDeviceLocalProviderMemoryUnderLoad`, which fails on the
+build host before this work at the same ceiling; server model, controller
+(extender selection), taskworker, gossip, alt and api suites green, the
+controller suite otherwise showing only its pre-existing ARIN and account
+reconcile failures; warp services and warpctl green; android 433 unit
+tests, apple 341 on the iOS simulator plus the macOS build, linux 232
+unit tests with every gui translation unit compiled, windows 47
+host-buildable cases with the WinUI code reviewed but not compiled on the
+macOS build host. Coverage audits added 147 tests in connect, 45 in the
+server and the sdk's own pass, each pinning every behavior of the change
+set; the audits found no product bugs, one wrong test assertion (the
+activator backoff schedule) and one wire fact (alt's refusal codes are not
+observable before the handshake completes).
+
+Operations before the network works end to end:
+
+- DNS: `gossip.bringyour.com` and `gossip.ur.network` as aliases of each
+  zone's `main-lb`; `alt`, `main-alt`, `alt-v4`, `alt-v6`, `main-alt-v4`
+  and `main-alt-v6` under both domains as the A and AAAA records of the
+  proxy hosts fireside and crisp, the family names single-family. No
+  plain A or AAAA record may exist at `extender.bringyour.com`, which the
+  taskworker publishes.
+- AWS credentials with Route 53 access to both zones on the taskworker
+  hosts; the zone is resolved by name from `extender.yml`.
+- The router DNAT of public udp 53 to 4053 in front of the proxy hosts.
+- Deploy the gossip and alt services (both are in the build), then the
+  taskworker, api and connect with the extender changes.
+- The iOS sdk slice is 72 MiB against the 64 MiB ceiling of the size
+  check; the pending decision is a build tag excluding libp2p from iOS,
+  which every iOS device can afford since it runs the feed role, or a
+  reviewed ceiling of 76 MiB.
+- The linux gui release container gained `libzxing-cpp-dev`; the windows
+  build fetches zxing-cpp.
+
+Phase 10 (section M) is implemented on branch `extender-stats` in
+connect (this document), server, warp and mmm as of 2026-09-13, one
+agent per repository against the field names of M4, M7 and M8 as the
+contract, pushed and not merged. Server: the four location ids on
+`network_extender`, `create_time` on `contract_extender` copied from the
+contract, the extender, family and contract counts with the redis hour
+bucket cache, `extender_count` in the map export, the ten gauges, the
+public `extender network` row, the `urnetwork / providers` dashboard,
+PUBLICSTATS.md; the model suite, the root migration audit, the grafana
+suite and the extender and stats controller selections are green on the
+branch merged with main, the controller suite otherwise showing only its
+pre-existing mmdb failures, and the build needs the sdk at the commit
+main's proxy package expects. Warp: the seven feed fields, suite green.
+Site: the feed and map parsers, the geometry helper with its own node
+tests, the rings and hover on the globe, the headline and legend; the
+scripts suite is green but for one pre-existing test that asserts
+against the sdk source, and the vite build passes.
+
+Operations for phase 10: run the migrations before deploying the api
+(which writes the location ids at activation) and the taskworker (whose
+collector and map export read them); deploy the taskworker, the api and
+the warp grafana front; publish the dashboards with
+`bringyourctl grafana load-defaults`, which adds the providers dashboard
+and the public row under the unchanged public uid; the site picks up the
+extender headline on its next build once the feed carries the count.
+
+Phases 11 and 12 (sections N and O) are implemented on branch
+`extender-ui` in connect (this document), sdk, localizations, apple,
+linux and windows as of 2026-09-14, the connect and sdk halves first and
+then one agent per desktop app, the sdk and each app fixed from their
+reviews against N and O; nothing is merged or pushed. Connect (`8acd1ad`,
+`c4921fd`): the relay counters of O1 and `LastRefused`; the extender
+package is green under `-race` and the activation tests of the root
+package pass three times over. Sdk (`abe132a` to `e035c92`): the status
+fields and the state rule, the `Device` interface and `DeviceRemote`
+mirror with the queued setting, the setting cache, the status watches
+armed before their goroutines start (`776c19d`), `GetExtenderStats`, the
+extender series and its presence notification, and the regenerated cgo
+exports (`4a68ddb`); the focused and full suites are green but for the
+build host's pre-existing memory ceiling flake in
+`TestDeviceLocalProviderMemoryUnderLoad`, `./test.sh` and the `cgo/gen`
+tests are green, and the apple and android bindings are built.
+Localizations (`442a792` to `92819b0`): the keys of N5 and O6, generated
+into the three app trees. Apple (`cfb5d70` to `07bc61c`): the macOS row
+in the Connections card and on the earnings screen, and the extender
+statistics section; 618 of 618 tests, the new ones among them, pass on
+the iPhone 16 Pro simulator and the unsigned iOS and macOS Release
+builds succeed, while the macOS test host on the build machine hangs
+before its tests start in the latest runs, traced to the sdk's first
+access to the shared app group container and reproduced on the code
+before the fixes, so the hang is environmental. Linux (`511ddd1` to
+`ed07358`): the row on the Connect page, and the two statistics groups
+with the read-only row on the earnings page; 255 unit tests pass and
+every touched GUI translation unit syntax-checks on macOS with no error
+and no new warning, there being no Linux host. Windows (`2328df4` to
+`2a68e21`): the same on the Connect and wallet pages; the 67 host cases
+of `tools/extender-tests.cpp` pass and `./test.sh` passes, while the
+WinUI code and the XAML are reviewed and not compiled. Not verified:
+nothing ran on Linux or Windows, no pass was made with VoiceOver, Orca or
+Narrator, and no window shown again was checked by hand on any platform.
+Outside this work: the macOS kill switch and notification toggles still
+draw as checkboxes beside the Extender switch. Since then, a hide to the
+tray on Windows closes every open sheet, the Connect page's older sheets
+included (windows `d86057b`).
+
+Operations for phases 11 and 12: none beyond releasing the sdk and the
+app builds that carry it. No server, database, DNS or services change
+is involved, and the rpc version is unchanged: an app newer than its
+device process hides the Extender row and the extender statistics until
+that process runs this sdk (N1, N2), and an older app never calls the
+new methods, so apps and daemons update in either order.
+
+Phase 13, the TXT bootstrap (B3, C5, E1, E3), is implemented in connect
+(this document) and the server as of 2026-09-17, uncommitted, together
+with the h3 hostname passthrough (the alt service as every h3 and dns
+carrier's destination, carried as a name in the extender header and
+resolved at the extender) of the same day. Server: the TXT sets of C5 in
+the geo dns publisher, `GetActiveNetworkExtenderForRecord` for the
+signer, and the Route 53 listing owning TXT sets under the `extender-`
+prefix; the publisher suite is green against the local environment.
+Connect: TXT over DoH (`DohQueryTxt`), `DecodeExtenderDnsRecord` and its
+inverse, the bootstrap applying TXT records before the address answers,
+and the directory's dialability rule in `Candidates`, `AddressUsable`,
+`UsableCount` and `ActiveCount`; the hold-policy tests moved to manual
+addresses since the hold is what they are about; the root, extender and
+gossip packages' extender selections are green.
+
+Operations for phase 13: deploy the taskworker first and confirm
+`dig TXT extender.<host>` answers with values that decode, then release
+the connect change in the sdk and the apps. In the other order, a new
+client on an old operator has no dialable extender until the TXT sets
+exist. An old client ignores the TXT sets. Nothing else changes: no
+migration, no services version, no rpc version.
+
+- **A12, admission limits (2026-09-23).** `extender/extender_admission.go`:
+  peppered /29·/56 subnet hashes, two per-instance token buckets refilled at
+  the limit per minute with the limit as burst (a subnet takes an instance
+  token once per window; the table holds max(4096, 4 × the subnet limit)
+  and a full table refuses new subnets), admission after the header and
+  secret check and before the service switch — a bad secret stays an
+  uncounted 403, a whitelist refusal counts — signed headers exempt from
+  the per-subnet limit, `AdmissionUnlimitedSources` matched masked at
+  accept, 429 with a random `Retry-After` closing the connection (a stream
+  on h3), the refusal cap closing before TLS on tcp and refusing the QUIC
+  Initial. Client: `ExtenderLimitedError`, `RecordLimited` in the
+  directory, limited candidates after every unlimited one earliest-expiring
+  first, the probe pass and feed dial skipping them, a network client that
+  waits for the earliest limit when all are limited and does not grow its
+  backoff, a limited peer re-pinged when its limit ends, `Retry-After`
+  capped at a day and the jittered backoff at the hold maximum; NLayer hops
+  limited rather than held, with `NLayerLimitedBackoff` (30 s), a front
+  answering 429 while its response is not yet written. connectctl flags
+  with underscores, refusing a non-CIDR value without repeating it; the
+  sdk's native role passes the limits through (0 = connect's default,
+  negative = off) and publishes the counts. Known-failing at HEAD and
+  unrelated: the root package's mobile memory-accounting test that the
+  `Admission` test pattern also selects.
+
+- **A13, QUIC version 2 on the udp carriers and the h3 dialers
+  (2026-10-07).** What changed: the client dial of the udp 443 and dns
+  carriers (A1; `dialExtenderQuic`, whose config `newExtenderQuicMemoryPolicy`
+  builds), the alt h3 and whodis dialers (L4; `dialAltQuicAttemptWithReservation`)
+  and the platform h3 transport (`newPlatformQuicConfig`) offer QUIC version
+  2 (RFC 9369, `0x6b3343cf`) first with version 1 behind it, and the
+  extender's udp carrier listener (`serveQuicCarrier`, the udp 443 and the
+  dns socket alike since they share the loop per A1) accepts both. Why: the
+  GFW (since 2024-04-07) and the TSPU decrypt a version 1 Initial with the
+  RFC 9001 salt to read the sni and drop a forbidden name; both parsers key
+  on that salt, so a version 2 Initial is not decrypted and the carrier
+  survives in both countries as of 2026. quic-go v0.61.0 offers `Versions[0]`
+  in the first Initial, accepts every version listed, and on a Version
+  Negotiation packet re-dials with the first of its own list the server
+  named, so a version 1 only peer is still reached at the cost of one round
+  trip and a version 1 only client (an older app) is still accepted.
+  Decisions: one policy per owner, `QuicVersionPolicy` (`net_quic_version.go`;
+  `prefer-v2` the default, `v1`, `v2`) on `ConnectSettings` for the extender
+  carriers and the alt dialers, on `PlatformTransportSettings` for the
+  platform h3 transport, and on `ExtenderSettings` for the listener, which
+  its NLayer hop dials (A11) inherit so one switch governs a whole extender;
+  the zero value and an unknown value are the default, so a settings struct
+  built without its defaults function, or a misspelled switch, offers version
+  2 rather than disabling a carrier; the extender dial takes the offer of its
+  own connect settings, not of the platform transport whose settings size
+  its windows; the policy is applied where each config is finalized, not on
+  the http3 template alt hands down, so the bare `quic.Config` fallback of
+  `altQuicBoundedTransport` cannot leave an attempt on version 1. Carrier
+  priorities are unchanged: QUIC stays one racer among many, since version
+  2 helps in China and Russia only (QUIC is blocked outright in Iran's
+  shutdowns and volume-banned in Turkmenistan). Source port rotation: a
+  failed attempt poisons its 4-tuple for 180 s at the GFW and 420 s at the
+  TSPU; each `dialExtenderQuic` already opens its own endpoint
+  (`openExtenderPacketConn`: the injected factory, else a fresh wildcard
+  socket) and closes it on failure before any retry runs, so a retry never
+  reuses the poisoned 4-tuple and no code changed; a host that injects a
+  `PacketConnFactory` decides its own ports. quic-go's own re-dial after a
+  Version Negotiation packet stays on the same endpoint, which is right: the
+  server answered, nothing is poisoned. Not guarded: the operating system
+  reissuing a just-closed ephemeral port (random on Linux, sequential on
+  Apple platforms). The sdk inherits the default through
+  `DefaultConnectSettings`, `DefaultPlatformTransportSettings` and
+  `extender.DefaultExtenderSettings` with no change; the switch is not
+  exposed to the apps. The platform server and alt (server repo, the same
+  quic-go, no `Versions` set) accept both by quic-go's default, so the h3
+  transport and the alt dialers handshake on version 2 against them without
+  a negotiation. Tests (connect `net_quic_version_test.go`, extender
+  `extender_quic_version_test.go`), every observation on the wire bytes of
+  the client's own udp endpoint or on the version the peer negotiated: the
+  first datagram's long-header version per policy at every construction
+  site -- the extender udp carrier, the alt h3 dialer, the platform h3
+  transport -- and the peer's negotiated version; the fallback against a
+  version 1 only extender, alt and platform (version 2 first, a Version
+  Negotiation packet read, version 1 negotiated); forced `v2` against a
+  version 1 only extender failing with `VersionNegotiationError` and never
+  sending a version 1 Initial; the listener accepting what its policy lists
+  and answering a Version Negotiation packet that names the accepted
+  versions for an excluded one; the full carrier handshaking on version 2
+  against the extender fixture with no negotiation; the hop dial inheriting
+  the policy; the defaults; and the rotation, against an in-process extender
+  that refuses the first source port for good with the failed endpoint kept
+  bound, so the retry's different port is the dial's doing. With the five
+  wiring lines reverted the first datagram is `0x00000001` at every site and
+  12 of the 14 tests fail; with the endpoint memoized across dials the
+  rotation test fails on the refused retry. Phased: nothing in connect. Not
+  done: an app setting for the switch, and a wire-level test of the dns
+  carrier's offer (its datagrams are dns-encoded; it dials the same
+  `policy.quicConfig` the udp carrier is proven on).
+- **Q, directory tiers (2026-10-07).** connect: the `DirectoryTier` record
+  field, `net_extender_directory_partition.go` (keyed partitions, vantage
+  keys), `net_extender_directory_release.go` (the gated release policy and
+  the in-process ledger), `net_extender_directory_canary.go` (canary
+  placement, attribution, per-country blocked state), the directory's keyed
+  `SampleRecords`, `OpenPartitionContains`, the no-publish rule for gated
+  records, the `release` source, the feed caps of 8, the feed server's
+  vantage-bound sample and stream, the validator ignoring gated records.
+  Server, written and compile-verified but not integration-built against a
+  database (the migration is unmerged): `directory_tier` and
+  `canary_channel` on `network_extender`, the release and block-report
+  tables, the tier in every signed record, open-only drip, dns and bootstrap,
+  the keyed dns sampler, the release and block-report routes, the
+  `directory` block of `extender.yml`. Phased per R5.
+- **S, the peer-to-peer webrtc carrier (2026-10-07).** connect, on branch
+  `feat/webrtc-extender`: the STUN pool and the dtls hello mimicry (S4),
+  the carrier, its stream adapter and signaling, the record's rendezvous,
+  the directory gate, the operator probes and the extender server's stream
+  entry (S1-S3), with the tests of S7. Server, written and run against the
+  local database (no migration): the C2a acceptance, the record's
+  rendezvous and the uptime path (S5), behind a signaling seam that
+  production does not yet fill. sdk, written and its role tests run: the
+  carrier in the role under G2 (S6). Phased per S8, the operator-side
+  signaling relay first.
+- **S8, the signaling relay, webrtc acceptance and the dial side
+  (2026-11-11).** connect, server and sdk on `feat/extender-webrtc-s8-1111`,
+  as S8 describes; the server's S5 work of `feat/webrtc-extender` was
+  written again on the probing of connect#230 rather than merged. Held for
+  the owner's release timing.
+
+## Design note: fingerprint-drift conformance harness (2026-10-07)
+
+A hermetic harness gates the chrome tcp/udp carriers against silent
+fingerprint drift from real Chrome. It is a new self-contained package,
+`connect/fingerprint/`, documented in its own `fingerprint/README.md` and
+linked from IPREAL.md's test section; it touches no carrier code. What it
+adds for the extender surface:
+
+- The udp carrier's QUIC Initial (section A, `net_quic_version.go`): a
+  Layer-A test (`net_quic_initial_conformance_test.go`) drives the merged
+  `QuicVersionPolicy.Versions()` — the same offer the extender udp and dns
+  carriers and the alt dialers hand quic-go — to a shared local QUIC endpoint
+  and asserts the first Initial's long-header version is the policy's first
+  offer. A silent regression of the default to a version 1 Initial, which the
+  GFW/TSPU decrypt and filter by sni, fails the test and names the version;
+  the v1-only policy is the faithful pre-version-2 revert that drifts against
+  the expected version 2. The transport parameters and CRYPTO-frame layout
+  live inside the AEAD-encrypted Initial and are the documented next increment.
+- The camouflage carrier hello (section P): a skipped placeholder
+  (`TestExtenderCamouflageHelloConformance`) names the camouflage impl branch
+  it waits on. When that branch is on origin/main the placeholder becomes the
+  real Layer-A comparison of the carrier's uTLS hello against the Chrome
+  golden, plus that the sealed session occupies the 32-byte legacy session-id
+  field and the rest matches Chrome. It is not stubbed against the dialer
+  meanwhile.
+
+Decisions: goldens are versioned and committed; the shipped golden is
+synthetic (uTLS `HelloChrome_133`, not real Chrome) and is upgraded to a
+real-Chrome capture by the opt-in Docker Layer B, gated out of `go test` by
+the `fingerprint_capture` build tag. The TCP SYN / IP TTL (JA4T) ground truth
+is the OS kernel, so Docker-Chrome yields only the Linux profile; non-Linux
+egress profiles are owner-supplied captures. Tests that prove it: the Layer-A
+version gate above, the tls client-hello gate
+(`net_tls_hello_conformance_test.go`), and the engine's own discrimination
+suite in `fingerprint/`, all hermetic and in the normal `go test`; a
+deliberately-stale golden is shown to fail the diff and the correct one to
+pass it. Phased: the per-dialer camouflage comparison and the IPREAL egress
+SYN/TTL comparison, each a skipped placeholder naming its branch.
+
+## Design note: camouflage implementation, phase 14a (2026-10-07)
+
+Phase 14a of section P (the authenticated hello and the splice, REALITY) is
+implemented in connect. This note records what landed, the decisions made while
+building it, the tests that prove each P10 property, and what is phased to 14b
+(server) and 14c (sdk). It references section P and the C2a acceptance; it does
+not restate or revise them.
+
+What landed (connect core, 14a):
+- The native reality construction (P0, P1) in `extender_reality.go`: the X25519
+  static key HKDF-derived from the ed25519 identity seed
+  (`ExtenderRealityStaticPrivateKey`/`ExtenderRealityStaticPublicKey`, info
+  `"ur-extender-reality-x25519-v1"`), the auth key
+  (`extenderRealityAuthKey`, salt `helloRandom[:20]`, info
+  `"ur-extender-reality-v1"`), the 16-byte plaintext (version `{2,0,0}`, a
+  reserved zero, the unix time, the 8-byte `ExtenderKeyId` short id), and the
+  server open (`ExtenderRealityOpenSessionId`) with the version-bound, short-id
+  and time-window checks (`ExtenderRealitySessionId{Authorized,InWindow}`). The
+  seal and the session-id offset are reused from `vless_reality.go`, not copied;
+  only the derivations, the info strings and the client version differ. xtls/
+  reality is not imported.
+- The server peek, demultiplex and splice (P2, P3, P4) in
+  `extender/extender_camouflage.go`: `peekClientHello` reassembles the first
+  handshake record or records into the complete ClientHello through
+  `utls.UnmarshalClientHello` (the package already links uTLS) without consuming
+  the bytes, which are replayed through the existing `connWithInitialBytes`; the
+  authenticated hello goes to `tls.Server` with the identity leaf and a
+  `{"http/1.1"}`-alone config; an unauthenticated hello is spliced to the real
+  borrowed site (splice on) or terminated as today (splice off). The bounded,
+  time-windowed seen-tag set closes REALITY's replay gap. The splice reuses the
+  A5 per-connection byte and idle bounds and adds the total and per-target
+  concurrent caps; a spliced byte is never added to the O1 relay counters.
+- The borrowed-names list (P5) in `net_extender_borrow.go`: a separate
+  `res/extender_borrow[_<cc>].bin` in the spoof resource's xor-masked gzip form
+  with the same per-country override, plus `VerifyExtenderBorrowDomain` for the
+  role-start verification (reachable, TLS 1.3, X25519/X25519MLKEM768, not a
+  shared CDN). No list is bundled yet, as P5 says it needs measurement first:
+  the bundled resource decodes to an empty list, which degrades the splice and
+  the client's front-name selection to the legacy path rather than breaking.
+- The client camo-first-then-legacy tcp race (P7, P8) in
+  `net_extender_camouflage.go`: folded into `dialExtenderTcp` as one dialer and
+  one carrier reservation, modelled on `raceExtenderDnsPorts`. The camouflaged
+  attempt is a faithful Chrome hello (the merged `chromeClientHelloSpec`) with
+  the sealed session id and the B3 leaf check; it is tried only when the config
+  carries a `RealityPublicKey` and the kill switch
+  `ConnectSettings.TlsClientHelloFingerprint` is not `"go"`. An attempt that the
+  server did not authenticate negotiates h2 (Phase A) or fails the B3 check
+  (Phase B), so the race falls to the legacy attempt; a refusal or limit ends the
+  race with that answer.
+
+Decisions:
+- Record field number. Section P names `RealityPublicKey` field 13, written
+  before the tiered directory and the webrtc carrier merged. Those took fields 13
+  (`DirectoryTier`) and 14 (`WebRtcClientId`), so the implemented field is 15,
+  the next free number. Old readers skip it exactly as P6 requires. This is the
+  only deviation from P's letter and it is forced by field-number collision, not
+  a design change.
+- The client ephemeral is read preferring the standalone X25519 key share
+  (group 29) over the X25519MLKEM768 hybrid (group 4588, trailing 32 bytes), on
+  both ends, so a Chrome hello that carries both agrees on one ephemeral without
+  a second ECDH.
+- The splice default resolves the borrowed name over a DoH cache on the client's
+  family and dials the result over the forward egress, with an egress-by-name
+  fallback; a test seam (`CamouflageSpliceDialContext`) overrides it for the
+  in-process fake borrowed site. Resolution is a detail that does not change the
+  P10 observables.
+- Phase A is the default (`CamouflageEnabled` off, `ExtenderCamouflageSplice`
+  off), per P3/P7.
+
+Tests (deterministic, in-process, synthetic `.example` names and the fixture's
+RFC-doc addresses; each shown failing on a faithful revert of its mechanism and
+passing with it):
+- auth ok + B3: `TestExtenderCamouflageAuthenticatedReachesDestination`.
+- ALPN (http/1.1 negotiated, not on the wire):
+  `TestExtenderCamouflageAuthenticatedNegotiatesHttp11`.
+- wrong key spliced: `TestExtenderCamouflageWrongKeySplicedPhaseB`, with the
+  crypto root cause `TestExtenderRealityOpenRejectsAWrongStaticKey`.
+- replay refused: `TestExtenderCamouflageReplaySet{RefusesReplay,EvictsOldestPastTheCap}`.
+- skew fallback: `TestExtenderCamouflageSkewedClientFallsToLegacyPhaseA` and
+  `...LosesTcpPhaseB`.
+- legacy client: `TestExtenderCamouflageLegacyClientPhase{A,B}`.
+- fragmented hello reassembled: `TestExtenderCamouflagePeekReassemblesFragmentedHello`
+  and `TestExtenderCamouflageFragmentedHelloAuthenticated`.
+- bounded splice (byte, total, per-target, and a spliced byte never counted as
+  O1 relay): `TestExtenderCamouflageSplice{ByteBound,TotalCap,PerTargetCap,NotCountedAsRelay}`.
+- the client race and kill switch: `TestRaceExtenderTcpCamouflage*`,
+  `TestExtenderCamouflageApplies`; the seal/open crypto: `TestExtenderReality*`;
+  the borrow list and verification: `TestBorrowDomains*`,
+  `TestVerifyExtenderBorrowDomain*`.
+
+Phased (not in 14a):
+- 14b server: `reality_public_key_hex` in the activation args, storing and
+  signing the key into the record, and the optional splice probe. The server
+  runtime already exposes `ExtenderServer.RealityPublicKey()` and
+  `CamouflageStats()`; the controller/model wiring and any migration are the
+  server repo's.
+- 14c sdk: the provider role deriving and publishing the static key (HKDF from
+  the identity seed, no new persistence), running `VerifyExtenderBorrowDomain`
+  at start and feeding `CamouflageBorrowNames`, `DeviceLocalSettings.DefaultCamouflage`,
+  the status counts and the bindings.
+- The fingerprint-drift harness's `TestExtenderCamouflageHelloConformance`
+  placeholder (the note above) can now be wired to the camouflaged dial's uTLS
+  hello; that is the harness owner's change, not this one.
+
+Implementation review follow-up, 2026-10-07:
+- Camouflage retirement refuses new splice admission and safely joins lazy
+  resolver construction. Hello peeking observes handler cancellation and joins
+  its callback before handing the connection to the next phase. Replay retains
+  partial record headers and bodies even when a read returns an error.
+- The splice owns cleanup before its initial write, retries short writes,
+  terminates zero-progress writes, clears the inherited hello deadline, and
+  joins its cancellation and relay workers.
+  The client race transfers ownership through an unbuffered result handoff;
+  completed losing attempts close their own connections after cancellation.
+- The WebRTC stream adapter supports concurrent net.Conn calls. Read ownership,
+  write chunk ordering, deadline changes, and close draining are coordinated;
+  close joins the drain reader and does not mistake an expired read deadline for
+  a dead association. Signaling answer delivery is nonblocking and atomic with
+  waiter retirement. Carrier shutdown cancels and joins pending dials, and offer
+  exchange receives a finite negotiation deadline.
+- Vless strategy evidence separates private configurations and rejects stale
+  attempts across replacements, including an A-to-B-to-A change. DNS synthesis
+  retains bounded, expiring per-peer EDNS capability independently of queued
+  request headers. Signed canary restrictions use record field 16 without
+  changing the merged WebRTC or camouflage field numbers.
+
+The permanent lifecycle, strategy-identity, DNS-state, and signed-record tests
+cover these root causes with synthetic fixtures and explicit ordering. This
+review preserves the phased server/SDK and empty borrowed-resource limitations
+listed above; it does not change their deployment status.
+
+## Design note: authenticated seed bundle (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+The cold-start bootstrap of EXTENDER-UPDATE2 §2 is built in connect as a
+separate signed format beside the unsigned K7 share, which is unchanged.
+
+- Format (`protocol/extender.proto`, new messages only): `ExtenderSeedBody`
+  (format version 1, network host, sequence, issue and expiry times, serialized
+  open-tier records, serialized root-signed revocations) inside
+  `ExtenderSeedEnvelope` (body bytes, signature, key id). The envelope is
+  ed25519 over `ur-extender-seed-v1` || body; the key id is a lookup hint only.
+  The text form is `ur-seed:1:` and base64url without padding
+  (`net_extender_seed.go`).
+- Trust: an envelope verifies only under the root keys the directory already
+  holds (network-space configuration or hello), and every record inside is
+  verified again under its own root signature, network host, tier
+  (`ExtenderRecordOpen`, so no gated or canary record) and expiry. A bundle has
+  no field for keys, hosts, gossip urls or resolver settings, and a body or
+  envelope with a field a v1 reader does not know is refused rather than
+  partly read. Records must list public addresses only, outlive the bundle, and
+  be issued before it.
+- Limits: 64 KiB per envelope (checked before decoding), 8 records, 32
+  addresses, 32 revocations, 8 KiB per record, 1 KiB per revocation, a 30-day
+  maximum validity, and a 5-minute clock allowance either way (the directory's
+  `RecordExpireSkew`). A clock outside the allowance gets an explicit
+  `expired` or `not_yet_valid` refusal.
+- State (`net_extender_seed_store.go`): per normalized network host, the
+  greatest accepted sequence, its body digest and the bundle, all hosts in one
+  document saved through a byte backend (`ExtenderSeedStore`, the shape of
+  `ExtenderDirectoryStore`; `ExtenderSeedFileStore` writes temp, sync, rename).
+  Lower sequences are rollbacks, a different body at the floor a conflict, the
+  same bundle idempotent; nothing is written on a refusal; a backend that cannot
+  load fails closed; an undecodable document is no history. A floor binds only
+  while its envelope verifies under the keys in force, so a floor set by a key
+  a root update removed, or by a root a K7 settings import installed, is void
+  and dropped; a rotation the client followed keeps its floor, and an empty key
+  set judges nothing.
+- Directory: records enter only through `ApplyRecord` and revocations through
+  `ApplyRevocationSource`, both with `ExtenderSourceSeed`, revocations first. No
+  address is ever added, so the dialability rule is unchanged: a seed address
+  without a verified key is not dialable. A record applied from a seed carries
+  a per-key `seed` marker (stored as `record_source`); a lapsed seed record is
+  never one of the retained expired identities, so the expiry recovery never
+  offers a stale seed to a new cold start. A newer record from another source
+  clears the marker.
+- Bootstrap pass (`net_extender_seed_bootstrap.go`): https mirrors, each with
+  an optional dns-independent address (tls still verifies the url's host);
+  redirects only to configured hosts over https within a bound; every mirror
+  runs its own attempts with backoff under one attempt, dial and byte budget and
+  one deadline, so a stalled mirror holds up only itself; the first acceptable
+  bundle wins and the rest are canceled. Per-mirror outcomes are fixed codes
+  with no addresses. After a usable apply the owner calls
+  `ExtenderNetworkClient.Wake`, which reads a failed hello and hint again at
+  once and runs a pass, so control reach and the gated release follow on the
+  seed's verified records.
+
+## Design note: seed bundle follow-up (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+Follow-up to the seed bundle note above, after an audit of connect main
+against EXTENDER-UPDATE2 §2.1–§2.4.
+
+- Mirror reads: a bootstrap pass reads a mirror response to at most one byte
+  past the 64 KiB envelope cap, which is the mirror contract of `/v1/seed.bin`
+  (api/bringyour.yml), and refuses a response with that byte, or a stated
+  length past the cap, as `too_large` before decoding. A mirror may still
+  serve the text form, but only of a bundle whose text fits the cap; a file or
+  paste import keeps the text form's own cap.
+- Stored apply: `ApplyStoredExtenderSeed` applies the accepted bundle of every
+  network host the directory accepts and passes over a host whose bundle no
+  longer verifies or is stale, which keeps its floor. One host's stale bundle
+  never keeps another's fresh one from applying.
+- One store per space: the void rule judges every state a seed document holds
+  under the keys of each call, so an acceptor and its store serve one network
+  space, whose hosts share its root keys. The sdk keeps one store per space.
+- K7 hostile root: `net_extender_seed_k7_test.go` takes a hostile share with its
+  settings through the importer's own path (decode,
+  `ExtenderShareRootKeyHexes`, `SetRootKeys`) and accepts a hostile bundle for
+  the real space at a huge sequence under it. Once the roots change back, by a
+  settings change or by the first hello, the hostile floor binds nothing, is
+  dropped from the document, and never comes back with the stored apply or a
+  restart; the next genuine bundle is accepted at its ordinary sequence. The
+  episode costs the genuine floor, which leaves the fresh-install bound: the
+  configured minimum sequence and the validity window.
+- Wake: `ExtenderNetworkClient.Wake()` rearms the hello and hint backoffs and
+  runs a pass at once. Hello is then read over the client strategy, which draws
+  its extenders from the same directory, so control reach follows the seed at
+  once. The pass itself still bootstraps first while the directory is below
+  `LowWaterCount` (4): with dns black-holed and a seed of fewer than four usable
+  records, the feed sample of the seed's records can wait up to `HelloTimeout`
+  (30 s).
+
+## Design note: gated-preferred selection and the release fetch (EXTENDER-UPDATE2 §1, 2026-11-02)
+
+The client half of EXTENDER-UPDATE2 §1. R3's release policy and the server
+route are unchanged by it; the release outcomes and retry times are the
+server's (contract R).
+
+- Policy (`net_extender_directory_gated.go`): `ExtenderDirectory.SetGatedPreference`,
+  off by default. When on, only the connection path changes: the client
+  strategy expands its extender dialers from `ConnectCandidates` and judges the
+  ones it holds with `ConnectAddressUsable`, while the feed, the probe pass and
+  the gossip node draw as before. The policy is judged at each draw, which the
+  strategy makes only when the dialers it holds did not deliver, so a healthy
+  direct connection is never routed through an extender and never waits for a
+  release.
+  - attempt: usable gated records exist. Only they and the manual addresses
+    the user configured are drawn, under one shared budget
+    (`AttemptTimeout`, 10 s). An open dialer the strategy already holds keeps
+    serving, so a gated record that never answers strands no working
+    connection.
+  - gated: a gated record connected, by a dial, a probe or the feed. The open
+    dialers drain: the collapse drops them for new requests and a live
+    connection through one runs on. A gated record that stopped being usable
+    since the last draw falls back before any open dialer is drained.
+  - fallback: verified open records are drawn after the gated ones, for a
+    reason from a fixed set -- `no_gated_record`, `release_<outcome>`,
+    `release_failed`, `gated_failed`, `gated_timeout`, `control_reach` -- and a
+    reachable release route that released nothing usable is a reason like any
+    other. A gated record that connects, or one newly usable (released since,
+    its hold lapsed), ends it; the hold timeout is the gated retry backoff.
+  - The policy asks for a release through `GatedRefreshMonitor` when the
+    current gated records fall below the low watermark and when it falls back
+    for a reason a release can mend; the fetch coalesces the ask.
+- Never a candidate: a revoked record, in any tier (a revoked record is never
+  lapsed, so never a retained expired identity), and a release record that is
+  not a current gated record of this space under the root keys in force or was
+  requested before a reset (`ApplyReleaseRecord`, by `ResetGeneration`).
+- Publication: the K7 share leaves out every address a gated or
+  channel-restricted record names, whatever source it arrived from and in use
+  or not. It carried them before, in-use first. The feed sample, the
+  subscribers (feed stream and mesh) and the seed publisher already refused
+  them.
+- Release fetch (sdk `extender_release.go`, `extender_release_space.go`): one
+  fetcher per space, `POST /network/extender-release` with the client token of
+  the device bound to the space (`bindExtenderRelease`; a hosted space and a
+  read-only extender store never bind). Every trigger -- the schedule, a path
+  change, the directory's ask, the seed bootstrap (`requestExtenderRelease`) --
+  shares one request and one retry budget. The normal refresh is 6 h after an
+  answer that released a record, brought earlier by a jitter of at most
+  30 min and never later than 1 h before the earliest expiry held; failures
+  back off from 1 min to 30 min; the operator's retry time is clamped to
+  [60 s, 6 h]; the client asks at most 4 times an hour and not within 60 s of
+  an answer. An unknown outcome is `empty`. A request that reaches nothing
+  tries the space's control reaches -- the cached verified open records
+  (`AllowOpenForControlReach`), then the seed bootstrap -- once per failure
+  run, and asks again at once when one made a verified open record usable.
+- Account change: a token of another network or client, a sign-out or an
+  unbind cancels the request that is out, discards its answer (answers apply
+  under the binding lock the change takes) and advances the space's account
+  monitor, which the seed bootstrap watches. When another identity binds, the
+  gated records released to the previous one are forgotten
+  (`ForgetGatedRecords`); revocations, open records, manual addresses and the
+  extender's own record stay. The schedule is stored per identity digest, so a
+  restart of the same identity does not ask again early.
+- Cohort control: `NetworkSpaceValues.ExtenderGatedPreference`, applied in
+  place, turns the policy and the fetch on together; outside the cohort the
+  client asks for nothing and spends no disclosure.
+- Status: `ExtenderStatus` gains the mode, the fallback reason, the usable gated
+  count, the last release outcome and the earliest gated expiry; the policy
+  and the fetch keep counts over fixed label sets (`ExtenderGatedStats`, the
+  fetcher's stats). No address, key, id or token is logged or counted.
+
+## Design note: the TCP splice rollout (EXTENDER-UPDATE2 §3, 2026-11-02)
+
+Slice F of EXTENDER-UPDATE2 implements §3.2 to §3.4 in connect. The pilot
+runbook is `EXTENDER-SPLICE-ROLLOUT.md`. This note records the decisions that
+change or extend section P. It does not revise P.
+
+- Operator probes in Phase B. P6 says the activation probe is unchanged and
+  proves tcp over the terminated path. A Phase B extender has no terminated
+  path for an unauthenticated hello: it splices the operator's legacy probe to
+  its borrowed site, where the B3 leaf check fails it. That refuses the
+  extender's activation and fails its uptime probe. The probes therefore take
+  the extender's camouflage key when the operator has one
+  (`ProbeExtenderCarrierWithCamouflageKey` and
+  `ProbeExtenderForwardWithCamouflageKey`, net_extender_camouflage_probe.go).
+  The tcp dial then runs the client race, camouflaged first and legacy second,
+  and either attempt passing passes the probe. In Phase A the probe proves what
+  it always did and claims nothing about the key: a wrong key passes over the
+  legacy attempt. That is no proof of possession. In Phase B only the
+  extender's own key passes. The camouflaged attempt fronts a name of the
+  operator's bundled global list, so Phase B also needs the operator's build
+  to carry the measured list. Without it the probe is legacy alone. The
+  activation probe uses the key the activation posts, and the uptime probe uses
+  the stored key (server 14b).
+- Splice posture. `ExtenderCamouflageSplice` is the posture until
+  `ExtenderServer.SetCamouflageSplice` sets one at run time. A posture set at
+  run time wins over the setting, so it is the rollback lever, and it applies
+  to new connections only.
+- Front names. A client fronts a given extender with one name: of its country's
+  list, or else the global list, the name with the greatest
+  sha256(domain, identity key, name) score (rendezvous hashing). An extender
+  covers the names of list versions V-1 to V+1 by default. A substituted name is
+  degraded coverage, not success (net_extender_camouflage_select.go).
+- Fingerprint goldens. A real Chrome 156 ClientHello is committed with its
+  version metadata (fingerprint/testdata). Real Chrome now opens
+  signature_algorithms with a grease value, which the diff normalizes like the
+  other ordered lists. The synthetic uTLS golden stays regression coverage
+  only.
+
+## Design note: release outcomes, capability eligibility and the outage rule (2026-11-02)
+
+EXTENDER-UPDATE2 §1.1, §1.3 and §3.2, server half (slice B). This adds to R3,
+R4 and P without rewriting them.
+
+- Outcomes. `ExtenderReleasePolicy.Release` sets `ExtenderReleaseResult.Outcome`
+  on every admitted answer: `ok`, `empty`, `epoch_spent`, `probation`,
+  `country_capacity` or `incompatible`. A refusal is an
+  `*ExtenderReleaseRefusal` (`rate_limited` or `unavailable`), which unwraps to
+  the existing errors and keeps their messages. A spent epoch decides an empty
+  answer before anything else, since nothing else can be released until the
+  epoch ends. `RetryAfter` is set only from the requester's own clock state:
+  the request window plus one second for a limit (the refused request counts
+  too), the epoch's end for `epoch_spent`, and the sooner of the epoch's end
+  and the probation's end for `probation`. `empty`, `country_capacity` and
+  `incompatible` carry none, since when a slot frees depends on other
+  identities. No outcome names a count, a partition or a record. The route
+  carries these as the additive `outcome` and `retry_after_seconds`.
+- Capability eligibility. `ExtenderRecordBody.RequiredCapabilities` is field
+  18 (`repeated string`). Field 18 was free on main, on every remote and local
+  branch, and in every worktree on 2026-11-02. A record lists the capabilities
+  a client must declare before a release hands it out. The policy reads them
+  through `ExtenderReleaseRequest.Compatible`. An incompatible record is skipped
+  like an ineligible one, after the family and blocked checks, and is never
+  charged. The identity's count, partition and epoch disclosures are the same
+  whatever it declares: a capability declared or dropped within an epoch never
+  refunds a disclosure or adds one past the count. The answer is
+  `incompatible` only when nothing compatible is left. The operator sets the
+  field only for an extender a release alone reaches (the gated tier, not a
+  dns canary) whose record carries a `RealityPublicKey`, and only from its
+  configured cohort (server `extender.yml`, `directory.capability_cohorts`). It
+  is therefore inert until the server signs the camouflage key (phase 14b). A
+  value no client knows is one no client satisfies.
+- Outage rule. A block now needs the operator's probe to reach the record
+  now, not merely within the probe window: a failed probe with no success
+  after it is an outage. Reports made before the last failed probe describe
+  that outage and do not count, even after the probe succeeds again.
+  `ExtenderBlockedState.ProbeFailed` records the failure. The server applies
+  the same rule to its tables: every active address's latest probe must have
+  succeeded within the window, a report sent while the extender fails its
+  probe is not recorded, and a failed probe on any family deletes the reports
+  made before it, since the tables keep only each address's latest probe. A
+  report holds the probe rows it read until it commits, so a probe failing
+  meanwhile either refuses it or deletes it after. A blocked canary still names
+  its one place (`ExtenderAttributeBlockedCanaries`) and blocks no other
+  record: blocked state stays per record, and the release keeps the epoch's
+  order among the rest.
+
+## Design note: the sdk seed lifecycle (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+The sdk half of the seed bundle, on the format and bootstrap pass of the two
+seed notes above (`sdk/extender_seed*.go`). A verified open record is extender
+knowledge, so none of this is per account.
+
+- A pass takes its sources in order, cheapest first, and stops at the first that
+  makes a record newly usable: the bundles the build carries, the accepted bundle
+  of each network host in the seed store (`.extender_seeds`, per space), then the
+  mirrors. Whatever is accepted is applied with source `seed`, revocations first,
+  and never adds an address. A sign-out keeps the store; "Reset extenders" clears
+  it. A hosted space runs no pass.
+- Mirrors: the space value `ExtenderSeedMirrors`, at most 8 entries, each an https
+  url and optionally an address to dial in place of resolving the host. That
+  address is the route that needs no dns: tls still verifies the url's host, which
+  is also the sni. An entry names one address, so a dual-stack mirror is two
+  entries with one url. A mirror is contacted directly, never through an extender.
+  With none configured a space takes the bundled table for its host, which is empty
+  until the owner decides what it names. A reset keeps them, since they are not
+  something the user learned.
+- Import: `ImportExtenderSeed`, `ImportExtenderSeedData`, `ImportExtenderSeedFile`
+  and the view controller's `ImportSeed*` take `ur-seed:1:` text or the raw
+  envelope and judge it as a fetched bundle, answering with a typed error id. It
+  stays separate from the K7 share: a seed has no settings to confirm, and a seed
+  for another network is refused rather than taken with its settings.
+- Embedded bundle: `res/extender_seed.txt`, empty by default, holds `ur-seed:1:`
+  lines and `min-sequence <host> <sequence>` floors. Being in the binary earns a
+  bundle nothing: it is judged like any other, and a release past its validity
+  reports `expired` on the seed status instead of using it. Bundles are added at
+  release time and not committed, since an old one only reports a failure.
+- Trigger and wake: a pass runs for the release fetch's walk of the control
+  reaches, and for the space's own trigger. Once the network client's first
+  attempt leaves nothing usable, the trigger asks the control route, runs a pass
+  only if it does not answer, and when the pass made something usable asks again
+  through it and calls `requestExtenderRelease`. A pass or an import that makes
+  something usable calls `ExtenderNetworkClient.Wake`, which rearms the hello and
+  hint backoffs and runs a client pass at once. An account change or a path change
+  cancels a pass in flight. Nothing it applied is undone.
+- Timings: a whole pass 60 s; one ask of the control route 20 s; one attempt at one
+  mirror 15 s. After a pass that made nothing usable the mirrors and the trigger
+  back off from 1 min, doubling to 1 h, and a path change or a pass that makes
+  something usable starts that over. After the control route answered with nothing
+  usable, the trigger asks again in 15 min. While something is usable it looks again
+  every 30 s, which is how it notices every usable address going on hold.
+- The `LowWaterCount` caveat: a woken network client still runs its dns bootstrap
+  first while the directory is below `LowWaterCount` (4). With dns black-holed and a
+  seed of fewer than four usable records, the feed sample of the seed's records can
+  wait out `HelloTimeout` (30 s). The trigger's own ask through the strategy does not
+  wait on it, so control reach and the release request land first.
+
+## Design note: the block report sender (EXTENDER-UPDATE2 §1.3, 2026-11-02)
+
+R4 and the outage rule of the note above gave the operator its half of the blocked
+state. No client sent reports, so the policy could not fire. This adds the sender:
+the rule in connect (`net_extender_directory_gated_block.go`), the pace and the
+report in the sdk (`extender_block_report.go`). No wire change, and no new exported
+sdk api.
+
+- The rule. A record is reported only when all of these hold:
+  - A real dial of its verified record failed, which arms it as a suspect and
+    counts for nothing else. The record is one the client was released or that its
+    connection path drew, current under the root keys in force, and not revoked,
+    expired, manual or the extender's own.
+  - Three attempts failed, at least 30 min apart, so at least an hour from first to
+    last. An attempt dials every carrier the record offers on every address it names
+    in the families the client dials now, with the budget of the operator's own
+    probe (15 s a dial).
+  - The control route (`/hello` through the strategy) answered before each attempt,
+    or nothing is dialed, and after it, or it does not count.
+  - All of it on one network path. A path change drops every suspect, ends a pass in
+    flight and holds the next attempt for a minute.
+  - Nothing answered meanwhile: a success or a 429 from any address on any carrier,
+    from an attempt or any other dial, drops the suspect.
+  - The last attempt is within 30 min, and the failure that armed it within 6 h.
+- Carriers. A report names none, and the operator's probe dials tcp alone. No field
+  was added. Since an attempt tries every carrier, tcp first, and a record with no
+  tcp carrier on an address of the client's families is never judged, a report means
+  every carrier failed, including the one the operator can compare. A failure of one
+  carrier is never read as a block, and a carrier field would add nothing the probe
+  could check.
+- Why attempts and not the dials a client makes anyway. After a gated record fails the
+  policy falls back to an open record, and with a dialer that delivers the strategy
+  does not expand again, so the record sits on hold and may not be dialed again that
+  hour. The probe pass stops once its window is full. A dial of the strategy also
+  fails for reasons past the extender (an inner request, a hedged deadline), and the
+  probe dial does not: it is answered by the extender itself. A natural failure is
+  what says a record is worth checking. An attempt is a latency probe with no
+  attestor, so it identifies no client, and it only re-dials an address this client
+  already dialed.
+- What it leaves alone. An attempt never calls `RecordFailure` or `RecordSuccess`, so
+  no hold, count, removal, order or policy mode moves, and a report changes nothing
+  in the directory. Evidence is per process and never stored: a restart starts over,
+  which takes another hour, so the hourly limit needs no store.
+- Bounds. One sender loop per space does one thing at a time. At most one attempt
+  pass per 30 min, of at most 3 records, gated first then the oldest; at most 16
+  suspects. A control route that does not answer holds the next pass from 5 min,
+  doubling to 1 h. At most 4 reports an hour per identity, 60 s apart; a report with
+  no answer backs off from 5 min to 30 min, while its evidence stays fresh; a
+  refusal waits out the hour. A record reported is left alone for a day, and one that
+  answered for 6 h. A client with nothing failing makes no extra dial or request.
+- Controls. Off by default, under the same cohort control as the gated preference
+  (`NetworkSpaceValues.ExtenderGatedPreference`), since a released record is what
+  gives a report its use and a new value would be new exported api. A hosted space
+  builds no sender, and a read-only extender store binds no identity. An account
+  change, through `extenderAccountMonitor`, cancels what is in flight, discards its
+  answer and forgets every suspect, quiet record and draw. Nothing logs an address,
+  key, id or token, the counts are over fixed label sets, and `ExtenderStatus` gains
+  nothing.
+- Release backoff. `requestExtenderRelease`, called once the seed bootstrap or an
+  import has established reach, now clears the failure backoff of the release fetch,
+  and starts a new run of failures with a walk of its own. It keeps the hourly cap,
+  the 60 s spacing and every wait an answer asked for. Before this, a recovery that
+  followed a failed walk waited out the backoff, up to 30 min. A request already out
+  when reach was established, or in its walk, coalesces the call. If it then fails,
+  it failed on the route before the reach, so the next request goes at once, as after
+  the fetch's own walk, within the hourly cap.
+- Tests: `net_extender_directory_gated_block_test.go` pins the rule against a fake
+  clock and a fake dial. `extender_block_report_test.go` (sdk) pins the timeline,
+  bounds, cancellation and logs, and `extender_block_report_routes_test.go` runs it
+  on a real client strategy, a real extender and the real probe: an extender that
+  answers is never reported, and one that answers with another identity is.
+  `extender_release_backoff_test.go` pins the backoff, failing first.
+- Known limit. The server counts distinct `client_id`s, so three devices behind one
+  firewall can block a record for their whole country until the reports age out
+  (24 h). That is the operator's rule and it is unchanged here.
+
+## Design note: the camouflage roles (EXTENDER-UPDATE2 §3, 2026-11-02)
+
+The runtime of section P had no production caller. `connectctl extender` (operator
+hosts, the gated cohort) and the sdk provider role (phase 14c) now run it, off unless
+asked, through one `extender.ExtenderCamouflageRole`. The controls and the steps to
+turn it on are in `EXTENDER-SPLICE-ROLLOUT.md`. This note records what changes or
+extends P. It does not revise P.
+
+- The key has no file. P1 derives it from the identity seed and the server opens tags
+  under that derivation, so a second file could only disagree with it. It is stable
+  exactly as long as the identity is kept, so `--camouflage` refuses an ephemeral
+  identity and an unreadable key file at start, before anything binds.
+- P5's rule stands: no verified name, no published key. The names change at run time,
+  so `ExtenderActivatorSettings.PublishedRealityPublicKey` reads the key at each post.
+  A key the operator has not heard is posted at once when a first name verifies. The
+  reverse waits for the next activation, so a bad pass that a retry repairs changes no
+  record and restarts no settling.
+- Verification dials through `extenderCamouflage.spliceDial`, the path the splice
+  takes, and a name must pass on every family the host can dial. Coverage is one claim
+  across families and a client's front name is chosen without regard to family, so a
+  name one family cannot reach is not covered there. The cost is that a dual-stack
+  host needs names reachable on both, or a working route on both, to have any.
+  `VerifyExtenderBorrowDomain` runs with no cdn check: the list is curated, and which
+  organizations count as a shared cdn is the measurement's call (§3.1).
+- The revalidation interval is `DefaultExtenderCamouflageRevalidationInterval`, 6 h, a
+  placeholder for the owner's number. A list's manifest can shorten it, and
+  `ExtenderCamouflageMinRevalidationInterval`, 10 m, floors both. A failed name is
+  retried alone on a doubling schedule from 5 m, so a host that starts before its
+  network is up recovers in minutes.
+- `CamouflageStatus` puts `no_verified_target` ahead of the posture and the gate, and
+  adds `coverage_incomplete`, which only a role can raise: only it knows the lists and
+  the verification times (`connect.EvaluateExtenderCamouflageCoverage`).
+- The clock's platform source now has its production caller. A client strategy reads
+  the Date of a response whose tls chain verified and whose final host, after any
+  redirect, is one of `ClientStrategySettings.PlatformApiHosts`. The sdk spaces and
+  connectctl name their api host and its family hosts. A js build's fetch exposes no
+  tls state and seals no camouflaged hello, so it reads nothing.
+- `--nlayer-hop` gains `camouflage_key`, for the tcp carrier and only beside `key`. It
+  changes no other dial.
+- Left for later: `DeviceLocalSettings.DefaultCamouflage` and the bindings 14c names, to
+  keep the exported sdk surface as it is, so an embedder cannot turn the sdk role on
+  yet; P7's status counts on `ExtenderProvideStatus`, for the same reason; and a
+  run-time rollback lever in connectctl, whose rollback is a restart without
+  `--camouflage_splice`. The revalidation timer is monotonic, so a desktop that sleeps
+  verifies late by the time it slept.
+
+## Design note: block reporters and what a client's errors say (EXTENDER-UPDATE2 §1.3, 2026-11-02)
+
+Two corrections to the block report note above, which this adds to.
+
+- Distinct reporters are networks. The server's threshold counted `client_id`s, so
+  one account's three devices blocked a record for a whole country. It now counts
+  distinct networks through `network_client`, joined on the client id of the report's
+  verified token, so the known limit in the note above is narrower: separate accounts
+  behind one firewall still count separately. The threshold value and the probe check
+  are unchanged. The table records no network, and this needs no migration. Reading
+  the row at count time means a report whose client has since been reaped (30 days
+  after it was deactivated) drops out, which errs toward no block.
+  `ExtenderBlockedState`'s reporter is whatever the caller passes, and the rule there
+  is unchanged.
+- A client's errors name no address. A failed dial names the address it dialed, and
+  sometimes this host's own, and the feed and probe lines of the network client also
+  named each candidate. All of it reached default-level logs, and the feed's text
+  reached `ExtenderStatus.LastError`. Those lines leave a device in feedback and
+  support, and a client holds gated records. Default-level lines of
+  `net_extender_network.go` and `net_extender_dns_progress.go` and `LastError` now go
+  through `extenderErrorText`, which takes every ip literal out by parsing it, and the
+  feed and probe lines no longer name the candidate. Lines behind a verbosity someone
+  opted into still do. Tests: `net_extender_network_log_test.go`.
+
+## Design note: the node's supplied dialer and operator tls resumption (connect#227, 2026-11-17)
+
+A miner runs one network space per SOCKS5 proxy slot, and each space runs a gossip
+node. go-libp2p's websocket transport takes no dialer: it resolves `gossip.<host>`
+with the host's resolver and dials it with `net.DialTCP`. So every slot's operator
+link left from the host's own address, outside the slot's proxy, which 8395's
+constraint forbids. At 1000 slots those links were refused after tls and retried,
+and every retry was a full tls 1.3 handshake that verified the operator's P-384 chain.
+
+- **API** (`connect/gossip`, `NodeSettings`):
+  - `DialContext connect.DialContextFunction`. When set, every connection of the
+    node goes through it: the operator link's tcp, tls and websocket upgrade
+    (`transport_websocket.go`), and every extender carrier dial. The swarm hands the
+    operator's address over unresolved (`SkipResolve`), so the dialer gets
+    `tcp gossip.<host>:443` and a socks proxy resolves the name on its own side. The
+    carrier gets a copy of `ConnectSettings` with
+    `DialContextSettings{DialContext: dialer}`, which `ConnectSettings.DialContext`
+    takes ahead of its own proxy. Listening stays with libp2p's transport. Nil now
+    dials through `ConnectSettings.DialContext` (see the note on a space's egress
+    below); when this note was written, nil kept libp2p's own dialing.
+  - `TlsSessionCache tls.ClientSessionCache`: the operator link's session cache. Nil
+    takes the process's shared cache.
+  - The operator's tls verifies against `ConnectSettings.TlsConfig`:
+    the pinned roots, plus `URNETWORK_CONNECT_EXTRA_ROOT_CA_FILE` where set. The
+    server name is the address's sni or dns name, and the alpn is http/1.1.
+- **Session cache** (`tls_session_cache.go`). One per process, by the owner's
+  decision, bounded at 16 servers and 64 sessions per server. Each session is handed
+  out once (RFC 8446 C.4). The slots leave through different proxies, and a ticket
+  presented twice would let anyone who sees both connections link those proxies. The
+  operator, which issued the ticket, can link them either way.
+- **Server side.** The warp lb's nginx terminates the operator's tls:
+  `ssl_session_cache shared:SSL:10m`, `ssl_session_timeout 10m`,
+  `ssl_session_tickets off`, tls 1.2 and 1.3, no early data. With tickets off, OpenSSL
+  issues tls 1.3 stateful tickets backed by that cache. A probe from a developer Mac
+  to `gossip.bringyour.com` on 2026-11-17 found:
+  - tls 1.3, with two tickets after a full handshake and one after a resumption;
+  - the second dial resumed, and a ticket presented twice resumed too, since a
+    session stays usable for the 10 minute timeout;
+  - the pinned roots verify the chain.
+
+  The cache is per lb host, so a dial that lands on another host does a full
+  handshake.
+- **Resumption by platform.** On linux, where the miners run, a resumption checks no
+  chain. On darwin, windows and ios, crypto/tls re-verifies the cached chain on
+  resumption, so there it saves the certificate exchange but not the verification.
+- **The sdk's part.** Superseded the same day: every space's node dials through its
+  own connect settings and the sdk passes no dialer (`spaceExtenderNodeSettings`;
+  the note on a space's egress below).
+- **Tests:** `gossip/node_dialer_test.go`, `gossip/tls_session_cache_test.go` and
+  `gossip/transport_websocket_test.go`.
+  - A canary listener stands at the address the node is told, and another stands on
+    `ConnectSettings`' own route; neither sees a connection, the dialer gets the name
+    unresolved, and every connection the operator accepts came from a socket the
+    dialer made, redials included.
+  - A tls front, standing in for the lb, sees a full handshake and then a resumption.
+  - A node with a dialer still listens.
+  - A node without one dials through the space's dial (the note on a space's egress).
+
+## Design note: one extender stack per miner process (connect#227, 2026-11-17)
+
+A miner ran one network space per proxy slot, and each space built a whole
+extender stack: a directory, a network client with its sample, hello, hint and
+probe loops, a gossip node, and the release, camouflage, block and seed parts. At
+1000 slots that was 54-62% of the process's CPU, and most of its 19-31% in GC. Every
+slot also read and wrote one `.provider.extender.key`, so every node presented one
+peer id. Owner's decision, 2026-11-17: one stack per miner process, and one key per
+gossip node.
+
+- **The stack.** The run's extender slot (sn `providerExtenderSlot`) hosts it: its
+  space is built as before (sdk `NewNetworkSpaceWithUrls`), through that slot's own
+  proxy, and the run owns it, so the stack serves every slot until all of them have
+  joined. Every other slot's space is built on it (sdk
+  `NewNetworkSpaceWithUrlsOnExtenderHost`). Such a space runs none of the stack:
+  - its strategy draws extenders from the host's directory;
+  - its device presents no extender identity, attests no probes and runs no role;
+  - it has no webrtc carrier, since the carrier and its signaling are the host's.
+
+  A space with no host, a closed one, or one for another network runs its own stack.
+  Nothing changes for apps and for every other embedder, which build no space on a
+  host. The stack's slot also asked for the provider extender role, whichever slot it
+  was; since 2026-11-18 only a direct slot does, and a run of proxy slots runs none
+  (the note on a space's egress below).
+- **Reading a shared directory** (`ClientStrategySettings.ExtenderDirectoryReadOnly`,
+  `net_extender_strategy_evidence.go`). The slots dial along different paths, each
+  through its own proxy. A slot whose proxy is down would report every extender it
+  tried as failed, and so hold it for every slot and for the host's own network
+  client and mesh. So a reading strategy writes none of its dial outcomes into the
+  directory:
+  - it honors the holds and limits the owner's dials set;
+  - it holds an address it failed to reach for itself, on the directory's doubling
+    hold schedule and clock, bounded by the directory's address cap and cleared by a
+    success;
+  - its 429 limits stay on its dialers;
+  - the live connections it carries still count as in use, which is a fact of the
+    process.
+- **The node's dial.** The host's node dials through the host slot's proxy, as the
+  node's supplied dialer note above describes (sdk `spaceExtenderNodeSettings`).
+- **Identity** (sn `providerExtenderKeyFileName`). Each gossip node keeps its key in
+  `.provider.extender.<client id>.key`. The first node that finds its own file missing
+  adopts an install's `.provider.extender.key` by renaming it to its own name:
+  - an install that ran one node keeps its peer id and its extender record;
+  - the rename is the claim, so no other node, in this process or another on the
+    same state directory, can take that key, and a node that finds neither file
+    starts on a new one;
+  - sn's legacy key adoption keeps counting either name as an extender side file.
+- **Not changed.** The sn swarm (`ProviderSwarm`) still runs a stack per member.
+  Its members each bind a source address of their own, and none runs the extender
+  role.
+- **Tests.**
+  - connect: `net_extender_strategy_read_only_test.go`.
+  - sdk: `network_space_extender_host_test.go` and `extender_node_dial_test.go`.
+  - sn: `miner/provider_extender_stack_test.go`, which counts the run's directory loops
+    and status watches; three slots ran three before.
+
+## Design note: a space's egress, every dial (connect#227, 2026-11-17)
+
+The owner's decision of 2026-11-17 ("fix all, focus on correctness") on four leaks
+found while fixing connect#227: what a space sends must leave the way the space is
+configured. For a space whose egress is a socks proxy (`ProxySettings`) -- the sn
+miner's proxy slots -- that means through the proxy; for an app, under its egress
+binding (R1) and DialControl.
+
+- **Every gossip node dials through the space's dial.** This is a behaviour change
+  for every app (`gossip/node.go`, `transport_websocket.go`). The operator link no
+  longer dials with libp2p's websocket transport, which used `net.DialTCP` from the
+  host, outside the space's proxy, egress binding and DialControl, after resolving
+  the name with the host's resolver. With no `NodeSettings.DialContext`, the link
+  dials through `ConnectSettings.DialContext`. For an app that means:
+  - the egress binding, DialControl, the space's resolver and family policy, and its
+    keepalive and connect timeouts;
+  - the space's roots (`ConnectSettings.TlsConfig`, the pinned ones plus
+    `URNETWORK_CONNECT_EXTRA_ROOT_CA_FILE`) in place of the system's;
+  - alpn http/1.1;
+  - tls resumption from the process's session cache.
+
+  libp2p's websocket transport only listens. The sdk passes every space's connect
+  settings and no dialer of its own (`spaceExtenderNodeSettings`).
+- **A node dials only what its peering round chose** (`gossip/node_gater.go`). These
+  are the operator addresses it was given and the addresses the directory's records
+  name, each for its own peer. Before, a mesh peer could have the node dial an
+  address of its choosing, two ways:
+  - gossipsub peer exchange: with scoring off, a score of 0 is not below the
+    threshold of 0, so a prune's records of other peers were dialed;
+  - addresses a peer announced for itself over identify, which the swarm dials on
+    every redial.
+
+  Three layers now:
+  - every incoming rpc has its prunes' peer exchange taken out before gossipsub reads
+    it (`Node.inspectRpc`);
+  - gossipsub reads no peer exchange record (`PrunePeers` 0; its other parameters
+    are the defaults, so the mesh behaves as before);
+  - the swarm's gater refuses any dial to a peer or an address the current round did
+    not choose, before a transport sees it.
+
+  No node here sends peer exchange.
+- **A proxied space opens no udp socket of this host's**
+  (`net_proxy_packet_path.go`). A socks proxy carries streams only. SOCKS5 UDP
+  ASSOCIATE was not taken up: `x/net/proxy` has no client for it, and the proxies
+  miners use cannot be relied on to offer it. So the space fails closed for udp, and
+  its tcp carriers keep working through the proxy:
+  - The quic and dns extender carriers have a path only when the owner supplies one
+    (`DialContextSettings.PacketConnFactory`); they dial an ip literal, so nothing
+    is looked up.
+  - The alt api dialers are off, and the h3 platform transport modes are not
+    offered, endpoint or not: each resolves a platform name on this host before
+    it dials. h1 carries the transport, and an explicit h3 target falls back to h1.
+    An extender-only strategy keeps h3, since its extender resolves the name.
+  - The webrtc carrier is off, since ice gathers its own sockets.
+
+  These carriers are left out where they are chosen, so none is ever tried or held
+  against its extender:
+  - the strategy's extender and alt dialers, and its configured extenders;
+  - the network client's feed and probe walks, and the peer pinger;
+  - the platform transport's modes.
+
+  The sockets refuse too (`openExtenderPacketConn`, `dialExtenderWebRtc`,
+  `openH3PacketConn`), with `ErrExtenderPacketCarrierUnavailable`. A block attempt
+  treats that refusal like this host's memory budget: no evidence.
+
+  A space with a dialer of its own and no proxy keeps the `DialContextSettings`
+  contract: a nil packet factory is the platform's ordinary socket.
+- **A proxied space resolves no name on this host.**
+  - The client strategy installs no internal DoH resolver
+    (`clientStrategySettingsWithInternalDoh`). Before, its DoH dials, and its plain
+    dns fallback for the protected names, looked every platform name up from this
+    host before the dial went through the proxy. Names now go to the proxy
+    unresolved, and tls still verifies them against the platform's roots.
+  - The extender bootstrap's DoH queries go through the strategy's dial, the proxy,
+    with the default DoH servers when the space names none, and never fall back to
+    the system resolver (`ExtenderNetworkClient.bootstrapResolution`).
+  - The extender hint already refuses a proxied strategy. The gossip node passes
+    names unresolved, as above.
+- **Left to the owner on 2026-11-17.** These parts of a proxy slot's provider still
+  left from the host, by their designs:
+  - The provider's platform transports in a public provide mode were direct (J4,
+    sdk `standbyClientStrategy`, connect `NewDirectClientStrategy`), so the platform
+    saw the host's address, h3's udp included.
+  - The exit NAT's tcp and udp to destinations were the host's (sn passed no
+    `ProviderDialContextSettings`).
+  - P2P webrtc connections gathered the host's ice candidates.
+  - The extender role bound and forwarded on the host (G2).
+- **Decided 2026-11-18: route through the proxy.** The owner's decision ("Route
+  through the proxy"): every egress of a proxied space leaves through its proxy, so a
+  slot appears at its proxy's address and location and exits there.
+  - **Platform transports** (J4, amended). A public provider dials the platform on its
+    egress, which is its proxy if it has one. The pins and the public standby take
+    `NewEgressClientStrategy`: the space's settings without extenders or VLESS
+    servers, the proxy kept. A pin asks the proxy for its family name, which the
+    proxy resolves on its side, so the pin proves the proxy's family. The h3 modes stay
+    off for such a strategy, endpoint or not (above), so the transports carry h1. Only
+    a dial whose point is this host's own address drops the proxy:
+    `NewDirectClientStrategy`, which an extender's activation takes (C2).
+  - **Exit.** The sdk puts the exit nat on the space's egress
+    (`applyProviderExitEgress`): tcp through the proxy, udp only through the space's
+    packet endpoint, and no icmp echo. `ConnectSettings.DialContext` refuses a
+    datagram dial through a proxy that has no endpoint of the owner's
+    (`ErrExtenderPacketCarrierUnavailable`), whatever stream dial the host supplies,
+    and connects an owner's endpoint to the destination's ip literal
+    (`dialProxiedPacket`); a socks5 udp associate would come in as such an endpoint.
+    So no exit udp leaves from this host. A refused flow is answered with an
+    unreachable at once, so the source moves on. An echo socket is this host's, so the
+    nat marks its echo settings when its tcp or udp egress names a proxy, and an echo
+    flow opens none. sn passes the slot's settings in the space it builds for the
+    slot; the exit follows the space, with no `ProviderDialContextSettings`, so no
+    embedder can leave a proxied exit on the host by leaving that unset.
+  - **P2P.** Relay-only ice through the proxy is not supported (no TURN, and no socks
+    path for ice), so a proxied space opens no p2p stream: the sdk sets
+    `WebRtcSettings.DisablePeerConnections` for every client of the space, provider
+    and windows. Its stream manager takes no StreamOpen and its manager refuses a peer
+    connection (`ErrPeerConnectionsDisabled`), so the peers stay on the platform
+    transport. A client that asked for a stream keeps offering one that is never
+    answered, as for a stream a provider's policy refuses.
+  - **Extender role.** A proxied space never takes the role: the device does not ask
+    for it (`extenderProvideProviding`), the provider refuses it
+    (`setExtenderEnabledWithLock`), and sn asks for it on its direct slot alone. A run
+    of proxy slots still hosts the extender stack in its first slot, and runs no role.
+- **What a proxied space tells this host.** Three fixes beside the decision, since
+  more of a slot's dials now cross its proxy:
+  - The provider-local guard's observed addresses are process wide, and each
+    client's ObservedAddresses replaces them. A proxied slot's transports are now
+    seen at its proxy, so its message would replace this host's public address, which
+    a direct slot's exit and extender forward are guarded against (hairpin to the
+    router). The sdk sets `ClientSettings.SkipObservedAddresses` for every client of
+    a proxied space, which keeps them out.
+  - The control family ledger (`control_family.go`) is process wide, and a proxied
+    connection's family is the leg to the proxy. A dial of a space whose egress is a
+    proxy is dialed and handshaken once, and writes nothing to the ledger nor clears
+    anything from it (`dialControlTlsWithFamilyFallback`). Before, one slow proxy
+    could demote this host's family for every dial of the process, a miner's other
+    slots and its direct slot included.
+  - `ConnectSettings.ConnectTimeout` bounds a dial through a proxy end to end: the
+    connect to the proxy, its negotiation and the proxy's connect to the target. The
+    exit dials with a context that has no deadline, so a proxy that accepted and
+    never answered held the exit flow's dial for the flow's life.
+- **What changes for a proxied slot.**
+  - Its address and location are its proxy's: the platform places a connection by
+    its address, and the egress probe sees the proxy's exit. The address's
+    classification is the proxy's too: a hosting prefix keeps the slot out of
+    Quality, and a reviewed proxy or vpn address is a risk that excludes it.
+  - With no packet endpoint it carries no udp: every h3 leg of the quality probe
+    fails, so the slot never passes it, and the probe's evidence marks it tcp only.
+    Its pins prove only the families both this host and its proxy have.
+  - It earns nothing as an extender, since it runs no role.
+- **Tests (2026-11-18).**
+  - connect: `net_proxy_full_egress_test.go`.
+  - sdk: `device_local_proxied_space_test.go`.
+  - sn: `miner/provider_extender_slot_test.go`.
+
+  Each fails on the code before the decision:
+  - the group's pins and the public standby reach a canary platform on this host,
+    and the pins offer h3;
+  - the egress strategy drops the proxy;
+  - a proxied space's udp dial is handed to the host's own stream dial, a bare proxy
+    refuses it only in the socks client, and an endpoint with no stream dial panics
+    the dial;
+  - a socks proxy that never answers holds a dial past its connect timeout;
+  - a stalled handshake through a proxy demotes a family, and a refused one undoes a
+    demotion;
+  - a proxied client replaces this host's address in the guard with its proxy's;
+  - the exit's datagram reaches a canary on this host and its tcp reaches its
+    destination directly;
+  - an echo flow of a proxied exit asks for an echo socket;
+  - a client of a proxied space starts its stream opens, and a device's client
+    settings keep p2p and the observed addresses for a proxied space;
+  - a device and a provider in a proxied space ask for and try to start the role,
+    and sn's first proxy slot asks for it.
+- **Tests (2026-11-17).**
+  - connect: `net_proxy_packet_path_test.go` and
+    `net_proxy_name_resolution_test.go`.
+  - gossip: `node_dialer_test.go`, `node_peer_exchange_test.go`.
+  - sdk: `extender_node_dial_test.go`.
+
+  Each fails on the code before this note:
+  - a udp canary receives the quic dial;
+  - the strategy builds quic and dns dialers and the alt dialers;
+  - the probe walk tries all three carriers;
+  - the h3 target stays;
+  - the strategy resolves the platform's names itself;
+  - the bootstrap dials the DoH server from this host;
+  - the operator's name never reaches the space's dial, and DialControl sees no
+    socket;
+  - a prune's peer exchange is dialed;
+  - a stranger peer's address is dialed.
+
+## Design note: the dns carrier's port race keeps a dial that hears the extender (2026-11-22)
+
+The owner approved (2026-11-22) applying the rule of the whodis fix (connect
+b67da3eb: 9357e085, ed4b8590, 5569ea24) to the extender dns carrier's port race
+(L2, `net_extender_dns_ports.go`): a race never ends an attempt that is still
+hearing from the extender.
+
+- **What the old race did.** It launched the next port 250 ms after the last,
+  beside the attempts out. A port the memory budget refused waited for an
+  attempt to end, so the race never ended a hearing attempt at the stagger, but
+  the 250 ms rule still cost two things. A dns carried dial (the QUIC handshake
+  through the translation and the extender's answer) takes 0.2 to 0.4 s on
+  loopback in the new in-process fixture and 0.4 to 0.7 s at 100 to 200 ms of
+  one-way latency, so:
+  - with room for two claims, most dials opened their second port beside a
+    healthy first one, and abandoned that handshake when the first answered;
+  - with room for one claim, as on a phone, a first port the network
+    blackholes held the claim for its whole QUIC handshake bound
+    (`HandshakeIdleTimeout`, 35 s by default, 70 s in all), so the second port
+    was never tried within a request's deadline.
+- **What the race does now.** It is a whodis race (`quic_dial_race.go`):
+  - the next port launches one stagger after the last launch, beside the
+    attempts out, when the budget admits its claim, or at once when every
+    attempt out has failed. The stagger is `ConnectSettings.ExtenderDnsRaceStagger`,
+    1 s;
+  - a port the budget refused waits for an attempt to end or to stall. An
+    attempt has stalled once its socket has delivered nothing from the extender
+    for `ConnectSettings.ExtenderDnsRaceStallTimeout`, 2 s, since its launch or
+    its last packet. Only then, and only to free its claim for the refused
+    port, is it ended, and its dial returns `errQuicDialStalled`;
+  - the dns translation of each attempt reports what QUIC reads to the
+    attempt's receive clock (`dialExtenderQuic`);
+  - the port order (L2), the extender's answers (A4, A12), the memory refusal
+    retry, the joined errors and the loser cleanup are unchanged. The race never
+    holds more claims than the budget admits, because each attempt claims its
+    memory from the budget before it opens a socket, as before.
+- **Bounds.** A healthy attempt keeps its whole budget: its handshake bound, and
+  the request's `ConnectTimeout` after it. A silent one holds a claim that a
+  refused port needs for the stall timeout. The caller's deadline bounds the
+  dial. A cancel ends an attempt's handshake at once but does not cut its
+  request phase short (the request stream has its own deadline), so an attempt
+  ended for silence after its handshake keeps its claim until the extender
+  answers or its request deadline passes. That was already true of a loser's
+  cancel.
+- **The race's clocks are its own.** A platform h3dns dial through an extender
+  carries its gate lease's receive clock (`platform_h3_gate.go`), which times
+  what that dial hears from alt. The race strips it, so the extender carrier's
+  packets never move it: the carrier's keepalive acknowledgements would
+  otherwise hold the gate for a dial whose alt is blackholed beyond the
+  extender.
+- **Why `ConnectSettings`.** Every extender dial receives it: the strategy's
+  dialers, the feed, the probes, the peer pinger and the platform packet path.
+  `ClientStrategySettings` embeds it beside the alt race settings.
+- **Left alone.** The tcp camouflage race (P8) keeps its 250 ms stagger. It
+  takes no memory claim, so nothing waits on it, but it also opens the legacy
+  attempt beside a camouflaged handshake slower than 250 ms. L2's text above
+  still says 250 ms; this note supersedes it.
+- **Tests.** In `net_extender_dns_ports_test.go`, synctest races over a real
+  budget:
+  - a hearing attempt is kept past the stagger and the stall timeout;
+  - a silent one is ended at the stall timeout, counted from its last packet;
+  - a second claim launches beside without ending anything;
+  - the ports launch in their order;
+  - the race never holds more claims than one, two or three;
+  - a hearing attempt keeps its claim to the caller's deadline;
+  - the default schedule and the non-positive settings;
+  - the race's clocks are its own;
+  - the earlier race tests on the new schedule.
+
+  In `net_extender_dns_ports_live_test.go`, against an in-process extender dns
+  carrier through the production dial:
+  - one claim keeps a handshake hearing the extender at 300 ms and 1.2 s of
+    latency;
+  - two claims open one healthy handshake (the old race opened both ports);
+  - one claim ends a blackholed first port for the next, in both orders (the
+    old race failed at the dial's deadline);
+  - the dial feeds the attempt's clock (it did not before);
+  - the caller's clock hears nothing.

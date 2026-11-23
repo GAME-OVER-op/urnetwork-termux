@@ -1,0 +1,574 @@
+package connect
+
+import (
+	"cmp"
+	"maps"
+	"slices"
+	"sync"
+	"time"
+)
+
+type sequenceAckWindowSnapshot struct {
+	ackNotify           <-chan struct{}
+	headAck             sequenceAck
+	ackUpdateCount      int
+	selectiveAcks       map[Id]sequenceAck
+	contractMissingAcks map[Id]sequenceAck
+}
+
+// sequenceAckWindow is the ACK compression state, independent of timers and
+// route writers. Update coalesces cumulative progress and selective evidence.
+// takeResponse emits at most one head followed by a bounded oldest-first SACK
+// prefix strictly above it; overflow remains available for the next response.
+// All methods are safe for concurrent use; there is one draining consumer.
+// That consumer can drain between any two updates, so progress that became
+// delivered at one instant is published by one UpdateDeliveredPrefix.
+type sequenceAckWindow struct {
+	// There is exactly one draining consumer per sequence. A
+	// capacity-one signal coalesces any number of updates while that consumer
+	// is running and avoids allocating/closing a broadcast channel per packet.
+	ackNotify                 chan struct{}
+	ackLock                   sync.Mutex
+	headAck                   sequenceAck
+	hasHeadAck                bool
+	cumulativeProgressPending bool
+	ackUpdateCount            int
+	headQuietNotify           chan struct{}
+	// Unspent allowance for one extra head survives an ordinary timed
+	// response. A quiet head or the first response after idle consumes it.
+	headDeliveredByteCount ByteCount
+	// Zero after the pending head is consumed, even when its unused byte
+	// allowance survives. Repeats cannot spend that allowance on their own.
+	headUpdatedAt time.Time
+	selectiveAcks map[Id]sequenceAck
+	// Recovery requests never acknowledge delivery and therefore remain
+	// separate from both cumulative and selective acknowledgement windows.
+	contractMissingAcks map[Id]sequenceAck
+	// A gap is proved once per cumulative head, independently of snapshots.
+	// Retain a bounded set of distinct evidence across compression intervals;
+	// repeating the same proof must not disable compression under sustained loss.
+	// Zero disables early wakes.
+	gapNotify             chan struct{}
+	gapWakeSelectiveCount int
+	gapWakeSignaled       bool
+	gapEvidence           []uint64
+	// highest selectively acked sequence number; a head below it has
+	// selective acks outstanding above it, whether or not they were already
+	// written, so the next head advance is a hole filling
+	gapSelectiveMax uint64
+	// Nil by default. Runs after Update and UpdateDeliveredPrefix leave
+	// ackLock, the edges where the draining consumer may take a response.
+	afterUpdateForTest func()
+	// Nil by default. Runs under ackLock after notification tokens are
+	// drained and immediately before an overflow response rearms its wake.
+	beforeOverflowNotifyForTest func()
+}
+
+func newSequenceAckWindow() *sequenceAckWindow {
+	return newSequenceAckWindowWithGapWake(0)
+}
+
+func newSequenceAckWindowWithGapWake(gapWakeSelectiveCount int) *sequenceAckWindow {
+	return &sequenceAckWindow{
+		ackNotify:             make(chan struct{}, 1),
+		headQuietNotify:       make(chan struct{}, 1),
+		ackUpdateCount:        0,
+		selectiveAcks:         map[Id]sequenceAck{},
+		contractMissingAcks:   map[Id]sequenceAck{},
+		gapNotify:             make(chan struct{}, 1),
+		gapWakeSelectiveCount: min(gapWakeSelectiveCount, ackResponseMaxCount),
+	}
+}
+
+// Notify is the stable coalesced edge consumed by the one sequence worker.
+// It is safe to fetch without a lock because the channel never changes.
+func (self *sequenceAckWindow) Notify() <-chan struct{} {
+	return self.ackNotify
+}
+
+// GapNotify is the early-wake edge for the consumer's compression wait. Like
+// Notify it never changes, so it is safe to fetch without a lock.
+func (self *sequenceAckWindow) GapNotify() <-chan struct{} {
+	return self.gapNotify
+}
+
+// signalGapWakeWithLock fires once per cumulative head.
+func (self *sequenceAckWindow) signalGapWakeWithLock() {
+	if self.gapWakeSignaled {
+		return
+	}
+	self.gapWakeSignaled = true
+	select {
+	case self.gapNotify <- struct{}{}:
+	default:
+	}
+}
+
+// Pending checks whether a worker can proceed without constructing a
+// snapshot. The ACK-compression worker uses this before its wait and extracts
+// only a bounded response when it actually drains the window.
+func (self *sequenceAckWindow) Pending() bool {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	return 0 < self.ackUpdateCount ||
+		0 < len(self.selectiveAcks) ||
+		0 < len(self.contractMissingAcks)
+}
+
+// Only an advancing cumulative head restarts the sender's silence clock.
+// Duplicate heads and selective feedback cannot indefinitely defer a hole.
+func (self *sequenceAckWindow) PendingCumulativeProgress() bool {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	return self.cumulativeProgressPending
+}
+
+// PendingDispositionFor reports whether the not-yet-snapshotted window can
+// retire or materially rewrite one exact due item. Unrelated ACK progress must
+// not postpone its recovery: on a busy sequence, duplicate/newer selective
+// ACKs can otherwise keep Pending true indefinitely while the actual hole is
+// never retransmitted.
+func (self *sequenceAckWindow) PendingDispositionFor(
+	sequenceNumber uint64,
+	messageId Id,
+) bool {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	if 0 < self.ackUpdateCount && self.hasHeadAck &&
+		sequenceNumber <= self.headAck.sequenceNumber {
+		return true
+	}
+	if ack, ok := self.selectiveAcks[messageId]; ok &&
+		ack.sequenceNumber == sequenceNumber {
+		return true
+	}
+	_, contractMissing := self.contractMissingAcks[messageId]
+	return contractMissing
+}
+
+func (self *sequenceAckWindow) UpdateContractMissing(ack sequenceAck) {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	self.updateContractMissingWithLock(ack)
+}
+
+func (self *sequenceAckWindow) updateContractMissingWithLock(ack sequenceAck) {
+	if prior, ok := self.contractMissingAcks[ack.messageId]; ok {
+		if prior.unwrapped {
+			ack.unwrapped = true
+		}
+		if prior.compactContractRecoverySupported {
+			ack.compactContractRecoverySupported = true
+		}
+		if ack.transportType == TransportTypeUnknown {
+			ack.transportType = prior.transportType
+		}
+	}
+	self.contractMissingAcks[ack.messageId] = ack
+	select {
+	case self.ackNotify <- struct{}{}:
+	default:
+	}
+}
+
+// Wake asks the ACK worker to look again without adding feedback. Receiver
+// state such as an eviction notice needs an acknowledgement to carry it, and
+// the arrival that caused it may publish none of its own.
+func (self *sequenceAckWindow) Wake() {
+	select {
+	case self.ackNotify <- struct{}{}:
+	default:
+	}
+}
+
+// Adds feedback without delivery credit, including retransmitted heads and SACKs.
+func (self *sequenceAckWindow) Update(ack sequenceAck) {
+	func() {
+		self.ackLock.Lock()
+		defer self.ackLock.Unlock()
+		self.updateWithLock(ack, 0)
+	}()
+	if self.afterUpdateForTest != nil {
+		self.afterUpdateForTest()
+	}
+}
+
+// Publishes first deliveries that became cumulative progress at one instant:
+// one callback's batch, or a receipt run secured by one completion. apply runs
+// with ackLock held and may only call updateDeliveredWithLock, once per
+// delivery in sequence order. The draining consumer takes none or all of the
+// prefix. Between separate updates it could write a stale intermediate head,
+// and that write would start the compression interval the last head waits out.
+func (self *sequenceAckWindow) UpdateDeliveredPrefix(apply func()) {
+	func() {
+		self.ackLock.Lock()
+		defer self.ackLock.Unlock()
+		apply()
+	}()
+	if self.afterUpdateForTest != nil {
+		self.afterUpdateForTest()
+	}
+}
+
+// First delivery can earn bounded early-head credit on H1. The count is
+// consumed here rather than retained in every ACK record or selective entry.
+func (self *sequenceAckWindow) updateDeliveredWithLock(ack sequenceAck, deliveredByteCount ByteCount) {
+	if ack.transportType != TransportTypeH1 {
+		deliveredByteCount = 0
+	}
+	self.updateWithLock(ack, deliveredByteCount)
+}
+
+// Restore returns a locally unwritten response without rolling feedback back
+// over an update received while its route write was blocked. No delivery credit
+// is recreated; existing response bounds and cumulative absorption still apply.
+func (self *sequenceAckWindow) Restore(acks []sequenceAck) {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	for _, ack := range acks {
+		var newer sequenceAck
+		var exists bool
+		if ack.contractMissing {
+			newer, exists = self.contractMissingAcks[ack.messageId]
+		} else if ack.selective {
+			newer, exists = self.selectiveAcks[ack.messageId]
+		}
+		if exists {
+			if !newer.immediateSequenceNumberSet && ack.immediateSequenceNumberSet {
+				newer.immediateSequenceNumber, newer.immediateSequenceNumberSet = ack.immediateSequenceNumber, true
+			}
+			newer.deliveredImmediately = newer.deliveredImmediately || ack.deliveredImmediately
+			newer.unwrapped = newer.unwrapped || ack.unwrapped
+			newer.receiverTiming = newer.receiverTiming || ack.receiverTiming
+			newer.compactContractRecoverySupported = newer.compactContractRecoverySupported || ack.compactContractRecoverySupported
+			if newer.transportType == TransportTypeUnknown {
+				newer.transportType = ack.transportType
+			}
+			ack = newer
+		}
+		if ack.contractMissing {
+			self.updateContractMissingWithLock(ack)
+		} else {
+			self.updateWithLock(ack, 0)
+		}
+	}
+}
+
+func (self *sequenceAckWindow) updateWithLock(ack sequenceAck, deliveredByteCount ByteCount) {
+
+	if !self.hasHeadAck || self.headAck.sequenceNumber < ack.sequenceNumber {
+		if ack.selective {
+			if prior, ok := self.selectiveAcks[ack.messageId]; ok {
+				// Exact receiver timing is handled before byte application.
+				// A duplicate without metadata cannot re-enable legacy sampling.
+				if !ack.immediateSequenceNumberSet && prior.immediateSequenceNumberSet {
+					ack.immediateSequenceNumber, ack.immediateSequenceNumberSet = prior.immediateSequenceNumber, true
+				}
+				ack.deliveredImmediately = ack.deliveredImmediately || prior.deliveredImmediately
+				ack.receiverTiming = ack.receiverTiming || prior.receiverTiming
+				if prior.unwrapped {
+					// Coalesced selective Ack for the same message preserves any
+					// prior plaintext bit so one late wrapped resend cannot upgrade
+					// the Ack format past the sender's reach.
+					ack.unwrapped = true
+				}
+				if prior.compactContractRecoverySupported {
+					ack.compactContractRecoverySupported = true
+				}
+				if ack.transportType == TransportTypeUnknown {
+					ack.transportType = prior.transportType
+				}
+			}
+			self.selectiveAcks[ack.messageId] = ack
+			if self.gapSelectiveMax < ack.sequenceNumber {
+				self.gapSelectiveMax = ack.sequenceNumber
+			}
+			if 0 < self.gapWakeSelectiveCount && !self.gapWakeSignaled &&
+				!slices.Contains(self.gapEvidence, ack.sequenceNumber) {
+				self.gapEvidence = append(self.gapEvidence, ack.sequenceNumber)
+				if self.gapWakeSelectiveCount <= len(self.gapEvidence) {
+					self.signalGapWakeWithLock()
+				}
+			}
+		} else {
+			// a head advancing under outstanding selective acks is a hole
+			// filling; the sender's flight is head-blocked on this ack
+			self.gapWakeSignaled = false
+			self.gapEvidence = self.gapEvidence[:0]
+			if 0 < self.gapWakeSelectiveCount && self.gapSelectiveMax != 0 &&
+				(!self.hasHeadAck || self.headAck.sequenceNumber < self.gapSelectiveMax) {
+				self.signalGapWakeWithLock()
+			}
+			// cumulative head ack: or-in the prior head's plaintext bit
+			// (and any absorbed selective acks below the new head) so a
+			// single plaintext pack anywhere under the head keeps the
+			// ack plaintext. Selective acks at or below the new head are
+			// already dropped by the Snapshot pass.
+			if self.hasHeadAck && self.headAck.unwrapped {
+				ack.unwrapped = true
+			}
+			if self.hasHeadAck && self.headAck.compactContractRecoverySupported {
+				ack.compactContractRecoverySupported = true
+			}
+			if self.hasHeadAck && ack.transportType == TransportTypeUnknown {
+				ack.transportType = self.headAck.transportType
+			}
+			if !ack.unwrapped {
+				for _, sel := range self.selectiveAcks {
+					if sel.unwrapped && sel.sequenceNumber <= ack.sequenceNumber {
+						ack.unwrapped = true
+						break
+					}
+				}
+			}
+			if !ack.compactContractRecoverySupported {
+				for _, selectiveAck := range self.selectiveAcks {
+					if selectiveAck.compactContractRecoverySupported &&
+						selectiveAck.sequenceNumber <= ack.sequenceNumber {
+						ack.compactContractRecoverySupported = true
+						break
+					}
+				}
+			}
+			self.ackUpdateCount += 1
+			self.cumulativeProgressPending = true
+			wasQuietEligible := self.headDeliveredByteCount >= ackBurstTailByteCount && !self.headUpdatedAt.IsZero()
+			if 0 < deliveredByteCount || !self.headUpdatedAt.IsZero() {
+				self.headUpdatedAt = time.Now()
+			}
+			self.headDeliveredByteCount = min(ackBurstTailByteCount,
+				self.headDeliveredByteCount+min(ackBurstTailByteCount, max(0, deliveredByteCount)))
+			if !wasQuietEligible && self.headDeliveredByteCount >= ackBurstTailByteCount && !self.headUpdatedAt.IsZero() {
+				select {
+				case self.headQuietNotify <- struct{}{}:
+				default:
+				}
+			}
+			if prior, ok := self.selectiveAcks[ack.messageId]; ok {
+				if !ack.immediateSequenceNumberSet && prior.immediateSequenceNumberSet {
+					ack.immediateSequenceNumber, ack.immediateSequenceNumberSet = prior.immediateSequenceNumber, true
+				}
+				ack.receiverTiming = ack.receiverTiming || prior.receiverTiming
+			}
+			self.headAck = ack
+			self.hasHeadAck = true
+			// no need to clean up `selectiveAcks` here
+			// selective acks with sequence number <= head are ignored in a final pass during update
+		}
+	} else {
+		if self.headAck.messageId == ack.messageId && ack.receiverTiming {
+			self.headAck.receiverTiming = true
+		}
+		// past the head
+		// resend the head — fold this late ack's plaintext bit into the
+		// head so the resend covers it. Snapshots copy the value, so the
+		// internal value can be updated under ackLock without a published
+		// pointer or copy-on-write allocation.
+		if ack.unwrapped && self.hasHeadAck && !self.headAck.unwrapped {
+			self.headAck.unwrapped = true
+		}
+		if ack.compactContractRecoverySupported && self.hasHeadAck &&
+			!self.headAck.compactContractRecoverySupported {
+			self.headAck.compactContractRecoverySupported = true
+		}
+		self.ackUpdateCount += 1
+	}
+
+	select {
+	case self.ackNotify <- struct{}{}:
+	default:
+	}
+}
+
+// Snapshot is returned by value: it is consumed immediately by the caller and
+// never retained, so a heap allocation per snapshot is pure waste. The caller
+// always receives a copy of (or nil for) the selective acks, never the live
+// map, so the live map can be cleared and reused on reset.
+func (self *sequenceAckWindow) Snapshot(reset bool) sequenceAckWindowSnapshot {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+
+	// build the selective-ack copy lazily so the common in-order case (a
+	// cumulative head ack with no selective acks) allocates no map.
+	var selectiveAcksAfterHead map[Id]sequenceAck
+	if 0 < self.ackUpdateCount {
+		for messageId, ack := range self.selectiveAcks {
+			if self.headAck.sequenceNumber < ack.sequenceNumber {
+				if selectiveAcksAfterHead == nil {
+					selectiveAcksAfterHead = map[Id]sequenceAck{}
+				}
+				selectiveAcksAfterHead[messageId] = ack
+			}
+		}
+	} else if 0 < len(self.selectiveAcks) {
+		selectiveAcksAfterHead = maps.Clone(self.selectiveAcks)
+	}
+
+	var contractMissingAcks map[Id]sequenceAck
+	if 0 < len(self.contractMissingAcks) {
+		contractMissingAcks = maps.Clone(self.contractMissingAcks)
+	}
+
+	snapshot := sequenceAckWindowSnapshot{
+		ackNotify:           self.ackNotify,
+		headAck:             self.headAck,
+		ackUpdateCount:      self.ackUpdateCount,
+		selectiveAcks:       selectiveAcksAfterHead,
+		contractMissingAcks: contractMissingAcks,
+	}
+
+	if reset {
+		// keep the head ack in place. clear() reuses the live map's storage
+		// instead of allocating a fresh map; the caller holds only a copy.
+		self.ackUpdateCount = 0
+		self.cumulativeProgressPending = false
+		self.headDeliveredByteCount = 0
+		self.headUpdatedAt = time.Time{}
+		select {
+		case <-self.headQuietNotify:
+		default:
+		}
+		clear(self.selectiveAcks)
+		clear(self.contractMissingAcks)
+		// The signals correspond to state included in this snapshot. Drain
+		// them while ackLock excludes Update so the next empty snapshot cannot
+		// wake on a stale token. Gap evidence survives snapshots.
+		select {
+		case <-self.ackNotify:
+		default:
+		}
+		select {
+		case <-self.gapNotify:
+		default:
+		}
+	}
+
+	return snapshot
+}
+
+// takeResponse removes only the bounded response being sent. The caller owns
+// scratch; overflow stays pending and new cumulative progress can absorb it.
+// Selective entries are ordered even across responses, so a partial write
+// cannot manufacture multiple holes at the sender.
+func (self *sequenceAckWindow) takeResponse(scratch []sequenceAck, limit int) ([]sequenceAck, bool) {
+	return self.takeResponseKeepingBurstCredit(scratch, limit, false)
+}
+
+// A scheduled full response spends no extra-head allowance. Preserve at most
+// one quantum across that boundary so a split refill can still become quiet.
+// Immediate, idle and shutdown responses discard the old allowance.
+func (self *sequenceAckWindow) takeResponseKeepingBurstCredit(scratch []sequenceAck, limit int, keepBurstCredit bool) ([]sequenceAck, bool) {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	limit = min(limit, ackResponseMaxCount)
+	if limit <= 0 {
+		return scratch[:0], self.ackUpdateCount != 0 || len(self.selectiveAcks) != 0 || len(self.contractMissingAcks) != 0
+	}
+	acks := scratch[:0]
+	if self.ackUpdateCount != 0 {
+		acks = append(acks, self.headAck)
+		self.ackUpdateCount = 0
+		self.cumulativeProgressPending = false
+		if !keepBurstCredit {
+			self.headDeliveredByteCount = 0
+		}
+		self.headUpdatedAt = time.Time{}
+		select {
+		case <-self.headQuietNotify:
+		default:
+		}
+	}
+	headCount := len(acks)
+	for id, ack := range self.selectiveAcks {
+		if self.hasHeadAck && ack.sequenceNumber <= self.headAck.sequenceNumber {
+			delete(self.selectiveAcks, id)
+			continue
+		}
+		ack.messageId, ack.selective = id, true
+		index, _ := slices.BinarySearchFunc(acks[headCount:], ack, func(a, b sequenceAck) int {
+			return cmp.Compare(a.sequenceNumber, b.sequenceNumber)
+		})
+		index += headCount
+		if index < limit {
+			if len(acks) == limit {
+				acks = acks[:limit-1]
+			}
+			acks = slices.Insert(acks, index, ack)
+		}
+	}
+	for _, ack := range acks[headCount:] {
+		delete(self.selectiveAcks, ack.messageId)
+	}
+	for id, ack := range self.contractMissingAcks {
+		if len(acks) == limit {
+			break
+		}
+		ack.messageId, ack.contractMissing = id, true
+		acks = append(acks, ack)
+		delete(self.contractMissingAcks, id)
+	}
+	select {
+	case <-self.ackNotify:
+	default:
+	}
+	select {
+	case <-self.gapNotify:
+	default:
+	}
+	if len(self.selectiveAcks) != 0 || len(self.contractMissingAcks) != 0 {
+		if self.beforeOverflowNotifyForTest != nil {
+			self.beforeOverflowNotifyForTest()
+		}
+		// Wake can refill the token without ackLock, including while teardown
+		// withdraws held commitments. Coalesce with that wake instead of
+		// blocking the sole draining worker on its own notification channel.
+		self.Wake()
+	}
+	return acks, len(self.selectiveAcks) != 0 || len(self.contractMissingAcks) != 0
+}
+
+// One early head's complete encoded Transfer frame, including legacy and
+// encrypted wrapping, is at most ackResponseEntryMaxByteCount. Requiring one
+// hundred times that many freshly delivered bytes bounds additional encoded
+// head feedback at one percent of cumulative progress.
+const ackBurstTailByteCount = 100 * ackResponseEntryMaxByteCount
+
+// Removes only a sufficiently large cumulative burst's head once arrivals
+// have gone quiet. The ordinary response deadline still owns above-head
+// SACKs, missing-contract requests and eviction metadata.
+func (self *sequenceAckWindow) takeQuietHead(now time.Time, quiet time.Duration) (sequenceAck, bool, time.Time) {
+	self.ackLock.Lock()
+	defer self.ackLock.Unlock()
+	if self.ackUpdateCount == 0 || self.headDeliveredByteCount < ackBurstTailByteCount || self.headUpdatedAt.IsZero() {
+		return sequenceAck{}, false, time.Time{}
+	}
+	deadline := self.headUpdatedAt.Add(quiet)
+	if now.Before(deadline) {
+		return sequenceAck{}, false, deadline
+	}
+	ack := self.headAck
+	self.ackUpdateCount = 0
+	self.cumulativeProgressPending = false
+	self.headDeliveredByteCount = 0
+	self.headUpdatedAt = time.Time{}
+	select {
+	case <-self.headQuietNotify:
+	default:
+	}
+	select {
+	case <-self.ackNotify:
+	default:
+	}
+	for id, selective := range self.selectiveAcks {
+		if selective.sequenceNumber <= ack.sequenceNumber {
+			delete(self.selectiveAcks, id)
+		}
+	}
+	return ack, true, time.Time{}
+}
+
+// Signals only the transition to an eligible freshly delivered head and byte quantum.
+// Further arrivals move the checked quiet deadline without waking per Pack.
+func (self *sequenceAckWindow) HeadQuietNotify() <-chan struct{} {
+	return self.headQuietNotify
+}

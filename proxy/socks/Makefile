@@ -1,0 +1,26 @@
+
+
+all: clean build
+
+clean:
+	rm -rf build
+
+# dev adds the local control server and web panel (--control). The release
+# build target leaves them out.
+dev:
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 go build -tags dev -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/dev/
+
+build:
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/arm64/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=linux GOARCH=arm go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/arm/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/amd64/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=linux GOARCH=386 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/386/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=linux GOARCH=mips GOMIPS=softfloat go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/mips/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/mipsle/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=linux GOARCH=mips64 GOMIPS64=softfloat go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/mips64/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=linux GOARCH=mips64le GOMIPS64=softfloat go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/linux/mips64le/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/darwin/arm64/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/darwin/amd64/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/windows/arm64/
+	env GOEXPERIMENT=greenteagc CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-w -s -X main.Version=${WARP_VERSION}" -o build/windows/amd64/
+	COPYFILE_DISABLE=1 tar -czf build/proxy-socks.tar.gz -C build linux darwin windows

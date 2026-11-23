@@ -1,0 +1,490 @@
+package connect
+
+import (
+	"time"
+	"unsafe"
+)
+
+// The origin socket and Transfer acknowledge different delivery boundaries.
+// Keep bounded origin chunks until the source's inner TCP acknowledges them;
+// a successful Transfer callback alone cannot prove that a TUN/kernel kept a
+// segment. Chunk storage avoids retaining one pool root per MTU-sized packet.
+type tcpReturnChunk struct {
+	start   uint32
+	end     uint32
+	payload []byte
+	charge  ByteCount
+	fin     bool
+}
+
+func (self *TcpSequence) returnMemoryBudget() *TransferMemoryBudget {
+	if self.tcpBufferSettings.MemoryBudget != nil {
+		return self.tcpBufferSettings.MemoryBudget
+	}
+	return self.tcpBufferSettings.ReturnQueueBudget
+}
+
+// retainReturnChunk borrows payload and keeps an owned copy. Only the socket
+// reader calls it; waiting here propagates pressure into this flow's origin.
+// ACK callbacks merely release capacity and signal the dedicated replay worker.
+//
+// Every TCP flow of the NAT retains from one shared budget, and a reader that
+// finds it full waits in the budget's arrival order: bytes an acknowledgement
+// frees are reserved for the oldest waiting reader before any woken reader
+// runs. Waking every reader to race for them let the runtime pick: with no
+// idle processor the reader that waited first retained, read on and waited
+// again ahead of the readers it beat, so one flow kept every freed byte. A
+// reader held by its own per-flow limit takes no place in line until its
+// acknowledgements lift it. A queued reader keeps the metadata plan it queued
+// with: only this reader appends chunks, so the array it planned to grow
+// stays valid, and its per-flow limit stays met, while acknowledgements drain
+// the flow.
+func (self *TcpSequence) retainReturnChunk(payload []byte, start uint32, fin bool) bool {
+	// Account for the pool root and geometric slice growth of chunk metadata.
+	// Reserve before copying: a blocked flow borrows its existing socket read
+	// buffer and must not allocate another uncharged replay buffer.
+	charge := ByteCount(128)
+	if len(payload) != 0 {
+		capacity := len(payload)
+		for _, pool := range orderedMessagePools() {
+			if capacity <= pool.size {
+				capacity = pool.size
+				break
+			}
+		}
+		charge += ByteCount(capacity + MessagePoolMetaByteCount)
+	}
+	budget := self.returnMemoryBudget()
+	limit := self.tcpBufferSettings.ReturnQueueMaxByteCount
+	if limit <= 0 {
+		limit = max(ByteCount(self.tcpBufferSettings.MaxWindowSize), mib(1))
+		if budget != nil {
+			limit = budget.TotalByteCount()
+		}
+	}
+	if charge > limit || (budget != nil && charge > budget.TotalByteCount()) {
+		self.cancel()
+		return false
+	}
+	end := start + uint32(len(payload))
+	if fin {
+		end++
+	}
+	var waiter *transferMemoryReserveWaiter
+	defer func() {
+		if waiter != nil {
+			waiter.abandon()
+		}
+	}()
+	metadataCharge := ByteCount(0)
+	metadataCapacity := 0
+	for {
+		if self.ctx.Err() != nil {
+			return false
+		}
+		self.mutex.Lock()
+		if int32(self.receiveSeqAck-end) >= 0 {
+			self.mutex.Unlock()
+			return true
+		}
+		reserved := false
+		if waiter == nil {
+			metadataCharge = 0
+			metadataCapacity = cap(self.returnChunks)
+			if self.tcpBufferSettings.MemoryBudget != nil && len(self.returnChunks) == cap(self.returnChunks) && self.returnHead != len(self.returnChunks) {
+				metadataCapacity = max(4, 2*cap(self.returnChunks))
+				metadataCharge = ByteCount(metadataCapacity) * ByteCount(unsafe.Sizeof(tcpReturnChunk{}))
+			} else if self.tcpBufferSettings.MemoryBudget != nil && cap(self.returnChunks) == 0 {
+				metadataCapacity = 4
+				metadataCharge = ByteCount(metadataCapacity) * ByteCount(unsafe.Sizeof(tcpReturnChunk{}))
+			}
+			if self.returnByteCount+charge <= limit {
+				reserved = budget == nil
+				if budget != nil {
+					reserved, waiter = budget.tryReserveOrQueue(charge + metadataCharge)
+				}
+			}
+		} else {
+			select {
+			case <-waiter.ready:
+				reserved, waiter = true, nil
+			default:
+			}
+		}
+		if reserved {
+			var owned []byte
+			if len(payload) != 0 {
+				owned = MessagePoolCopy(payload)
+			}
+			// The first retained chunk starts the resend deadline. Later
+			// chunks leave it at the oldest chunk's progress, so only the
+			// first wakes the recovery goroutine to arm it.
+			first := self.returnHead == len(self.returnChunks)
+			if first {
+				self.returnChunks = self.returnChunks[:0]
+				self.returnHead = 0
+				self.returnProgressTime = time.Now()
+			}
+			if metadataCharge > 0 {
+				chunks := make([]tcpReturnChunk, len(self.returnChunks), metadataCapacity)
+				copy(chunks, self.returnChunks)
+				self.returnChunks = chunks
+				// Growth temporarily retains both arrays. Admission paid for the
+				// complete new backing before allocation; only now retire the old.
+				budget.Release(self.returnMetadataByteCount)
+				self.returnMetadataByteCount = metadataCharge
+			}
+			self.returnChunks = append(self.returnChunks, tcpReturnChunk{start: start, end: end, payload: owned, charge: charge, fin: fin})
+			self.returnByteCount += charge
+			if first {
+				self.signalReturnRecoveryWithLock()
+			}
+			self.mutex.Unlock()
+			return true
+		}
+		self.mutex.Unlock()
+		var granted <-chan struct{}
+		if waiter != nil {
+			granted = waiter.ready
+		}
+		select {
+		case <-self.ctx.Done():
+			return false
+		case <-granted:
+		case <-self.returnCapacity:
+		}
+	}
+}
+
+func (self *TcpSequence) signalReturnRecoveryWithLock() {
+	select {
+	case self.returnWake <- struct{}{}:
+	default:
+	}
+}
+
+// Called only after the ACK was validated against the emitted sequence range.
+// Duplicate credit additionally requires the caller's unchanged raw window and
+// payload-free ACK classification. Other feedback preserves earlier credit.
+//
+// An advancing ACK is progress, which moves the resend deadline later; the
+// recovery goroutine finds the new deadline when its armed timer fires, so an
+// ordinary ACK costs it no wake. It is woken only when the deadline moves
+// earlier: an ACK that resets a backed-off delay, one that readies the next
+// replay of a recovery, or the third duplicate.
+func (self *TcpSequence) acknowledgeReturnWithLock(ack uint32, duplicateAck bool) {
+	if self.returnHead == len(self.returnChunks) {
+		return
+	}
+	if ack != self.receiveSeqAck {
+		self.returnReopenPending = false
+		backedOff := 0 < self.returnAttempts
+		self.returnDuplicateAcks = 0
+		self.returnAttempts = 0
+		self.returnProgressTime = time.Now()
+		if self.returnRecoveryActive {
+			self.returnRecoveryReady = int32(ack-self.returnRecoveryEnd) < 0
+			self.returnRecoveryActive = self.returnRecoveryReady
+		}
+		for self.returnHead < len(self.returnChunks) {
+			chunk := &self.returnChunks[self.returnHead]
+			if int32(ack-chunk.end) < 0 {
+				break
+			}
+			MessagePoolReturn(chunk.payload)
+			self.returnByteCount -= chunk.charge
+			if budget := self.returnMemoryBudget(); budget != nil {
+				budget.Release(chunk.charge)
+			}
+			*chunk = tcpReturnChunk{}
+			self.returnHead++
+		}
+		// Amortized compaction keeps metadata bounded by the active window.
+		if self.returnHead > 0 && self.returnHead*2 >= len(self.returnChunks) {
+			count := copy(self.returnChunks, self.returnChunks[self.returnHead:])
+			clear(self.returnChunks[count:])
+			self.returnChunks = self.returnChunks[:count]
+			self.returnHead = 0
+		}
+		select {
+		case self.returnCapacity <- struct{}{}:
+		default:
+		}
+		if backedOff || self.returnRecoveryReady {
+			self.signalReturnRecoveryWithLock()
+		}
+	} else if duplicateAck && self.returnDuplicateAcks < 3 {
+		self.returnDuplicateAcks++
+		if self.returnDuplicateAcks == 3 {
+			self.signalReturnRecoveryWithLock()
+		}
+	}
+}
+
+// Owned by the existing replay worker. No payload or per-packet descriptor is
+// retained here; the NAT's fixed per-flow claim accounts for this metadata.
+type tcpReturnRecoveryFlight struct {
+	remaining int
+	next      uint32
+	end       uint32
+	frontier  uint32
+	pending   bool
+	opening   bool
+	windowed  bool
+}
+
+// Returns one retained packet range without allocating. Callers hold mutex;
+// payload remains borrowed only until they build the packet under that lock.
+func (self *TcpSequence) returnRecoveryRangeWithLock(seq uint32, end uint32) (uint32, []byte, bool) {
+	if int32(end-seq) <= 0 {
+		return seq, nil, false
+	}
+	for index := self.returnHead; index < len(self.returnChunks); index++ {
+		chunk := &self.returnChunks[index]
+		if int32(seq-chunk.start) < 0 {
+			break
+		}
+		if int32(seq-chunk.end) >= 0 {
+			continue
+		}
+		if chunk.fin {
+			return seq + 1, nil, true
+		}
+		options := 0
+		if self.enableTimestamp {
+			options = tcpTimestampOptionByteCount
+		}
+		ipHeader := Ipv4HeaderSizeWithoutExtensions
+		if self.ipVersion == 6 {
+			ipHeader = Ipv6HeaderSize
+		}
+		count := self.clampPathMtu(self.tcpBufferSettings.Mtu) - ipHeader - TcpHeaderSizeWithoutExtensions - options
+		if self.peerMss != 0 {
+			count = min(count, int(self.peerMss)-options)
+		}
+		payload := chunk.payload[uint32(seq-chunk.start):]
+		count = min(len(payload), max(1, count), int(uint32(end-seq)))
+		return seq + uint32(count), payload[:count], false
+	}
+	return seq, nil, false
+}
+
+// Plans a count-bounded contiguous range over retained chunks. A FIN is sent
+// alone after the preceding data flight has been cumulatively acknowledged.
+func (self *TcpSequence) returnRecoveryFlightEndWithLock(seq uint32, end uint32, count int) uint32 {
+	start := seq
+	for range count {
+		next, _, fin := self.returnRecoveryRangeWithLock(seq, end)
+		if next == seq || fin && seq != start {
+			break
+		}
+		seq = next
+		if fin {
+			break
+		}
+	}
+	return seq
+}
+
+// Three duplicate ACKs or the resend timer start recovery of already-emitted
+// bytes. The compatibility setting replays one packet per partial ACK. Larger
+// closed flights amortize ACK latency without opening another flight for each
+// partial ACK. A stalled flight retries only its oldest packet, with backoff
+// per flight. A fixed frontier excludes newly issued data. Return callbacks
+// run outside the flow mutex and retain their existing bounded admission.
+func (self *TcpSequence) runReturnRecovery() {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	defer func() {
+		self.mutex.Lock()
+		self.returnPersistPending = false
+		self.returnReopenPending = false
+		self.mutex.Unlock()
+	}()
+	var persistProgress time.Time
+	var persistDelay time.Duration
+	var persistAck uint32
+	var replay tcpReturnRecoveryFlight
+	for {
+		if self.ctx.Err() != nil {
+			return
+		}
+		var packet []byte
+		var persistPacket bool
+		var timeout <-chan time.Time
+		self.mutex.Lock()
+		if self.returnReopenPending && replay.pending {
+			if replay.opening {
+				replay.frontier = replay.next
+			}
+			replay.pending = false
+		}
+		if !self.returnRecoveryActive {
+			replay = tcpReturnRecoveryFlight{}
+		}
+		if replay.pending && int32(self.receiveSeqAck-replay.next) > 0 {
+			replay.next = self.receiveSeqAck
+		}
+		if replay.pending && replay.windowed {
+			end := self.receiveWindowEnd
+			if self.receiveWindowSize == 0 {
+				end = self.receiveSeqAck
+			}
+			if int32(end-replay.end) < 0 {
+				replay.end = end
+			}
+		}
+		if replay.pending && (int32(replay.next-replay.end) >= 0 || replay.remaining <= 0) {
+			if replay.opening {
+				replay.frontier = replay.next
+			}
+			replay.pending = false
+		}
+		persistEligible := self.returnPersistPending && self.receiveWindowSize == 0 &&
+			self.receiveSeqAck == self.receiveSeq && self.returnHead == len(self.returnChunks) &&
+			self.tcpBufferSettings.ReturnPersistTimeout > 0
+		if !persistEligible || persistAck != self.receiveSeqAck {
+			persistProgress = time.Time{}
+		}
+		if self.returnHead < len(self.returnChunks) {
+			delay := self.tcpBufferSettings.ReturnResendTimeout
+			if delay <= 0 {
+				delay = time.Second
+			}
+			delay = min(30*time.Second, min(delay, 30*time.Second)*time.Duration(1<<min(self.returnAttempts, 5)))
+			remaining := time.Until(self.returnProgressTime.Add(delay))
+			maxPackets := max(1, self.tcpBufferSettings.ReturnRecoveryMaxPacketCount)
+			ready := self.returnRecoveryReady &&
+				(maxPackets == 1 || int32(self.receiveSeqAck-replay.frontier) >= 0)
+			if !replay.pending && (remaining <= 0 || self.returnDuplicateAcks == 3 || ready || self.returnReopenPending) {
+				newFlight := !self.returnRecoveryActive || maxPackets == 1 || int32(self.receiveSeqAck-replay.frontier) >= 0
+				if !self.returnRecoveryActive {
+					self.returnRecoveryEnd = self.receiveSeq
+					self.returnRecoveryActive = true
+				}
+				count := maxPackets
+				if !newFlight || self.receiveWindowSize == 0 || self.returnReopenPending {
+					// Preserve the existing single-packet zero-window fallback;
+					// this does not extend the separate no-retained-byte persist.
+					count = 1
+				}
+				end := self.returnRecoveryEnd
+				if maxPackets > 1 && self.receiveWindowSize > 0 && int32(self.receiveWindowEnd-end) < 0 {
+					end = self.receiveWindowEnd
+				}
+				replay.next = self.returnChunks[self.returnHead].start
+				if int32(self.receiveSeqAck-replay.next) > 0 {
+					replay.next = self.receiveSeqAck
+				}
+				replay.end = self.returnRecoveryFlightEndWithLock(replay.next, end, count)
+				replay.remaining = count
+				replay.opening = newFlight
+				replay.windowed = maxPackets > 1 && self.receiveWindowSize > 0
+				replay.pending = replay.next != replay.end
+				if newFlight {
+					replay.frontier = replay.end
+				}
+				if replay.pending {
+					self.returnRecoveryReady = false
+					self.returnReopenPending = false
+					self.returnProgressTime = time.Now()
+					self.returnAttempts++
+					self.returnDuplicateAcks = 4 // one fast flight per unchanged ACK
+				}
+			}
+			if replay.pending {
+				seq := replay.next
+				next, payload, fin := self.returnRecoveryRangeWithLock(seq, replay.end)
+				if next != seq {
+					flags := byte(tcpFlagAck)
+					if fin {
+						flags |= tcpFlagFin
+					}
+					packet = self.tcpPacket(flags, replay.next, payload)
+					replay.next = next
+					replay.remaining--
+				}
+				replay.pending = next != replay.end && next != seq && replay.remaining > 0
+				if !replay.pending && replay.opening {
+					// PMTU can shrink between callbacks. Close at the range actually
+					// offered within the packet debit, never at unsent planned bytes.
+					replay.frontier = replay.next
+				}
+			}
+			if packet == nil {
+				if remaining <= 0 {
+					// No retained byte fits the advertised range. Keep a bounded
+					// wake rather than repeatedly resetting an expired timer.
+					remaining = delay
+				}
+				timer.Reset(remaining)
+				timeout = timer.C
+			}
+		} else if persistEligible {
+			if persistProgress.IsZero() {
+				persistProgress = time.Now()
+				persistDelay = self.tcpBufferSettings.ReturnPersistTimeout
+				persistAck = self.receiveSeqAck
+			}
+			remaining := time.Until(persistProgress.Add(persistDelay))
+			if remaining <= 0 {
+				// Match TCP's zero-window probe: one already-ACKed byte elicits
+				// the peer's current window without issuing any new stream byte.
+				packet = self.tcpPacket(tcpFlagAck, persistAck-1, []byte{0})
+				persistPacket = true
+			} else {
+				timer.Reset(remaining)
+				timeout = timer.C
+			}
+		}
+		self.mutex.Unlock()
+		if packet != nil {
+			if persistPacket {
+				self.receivePacket(packet, receiveRecoveryModeDedicatedTcpControl)
+				self.mutex.Lock()
+				if self.ctx.Err() == nil && self.returnPersistPending && self.receiveWindowSize == 0 &&
+					self.receiveSeqAck == persistAck && self.receiveSeq == persistAck && self.returnHead == len(self.returnChunks) {
+					persistProgress = time.Now()
+					maxDelay := max(self.tcpBufferSettings.ReturnPersistTimeout, self.tcpBufferSettings.ReturnPersistMaxTimeout)
+					if persistDelay < maxDelay {
+						persistDelay += min(persistDelay, maxDelay-persistDelay)
+					}
+				} else {
+					persistProgress = time.Time{}
+				}
+				self.mutex.Unlock()
+				continue
+			}
+			self.receivePacket(packet, receiveRecoveryModeTcpSocket)
+			continue
+		}
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-self.returnWake:
+		case <-timeout:
+		}
+		if self.afterReturnRecoveryWakeForTest != nil {
+			self.afterReturnRecoveryWakeForTest()
+		}
+	}
+}
+
+// Run calls this after all readers, callbacks and the replay worker have joined.
+func (self *TcpSequence) releaseReturnChunks() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for _, chunk := range self.returnChunks[self.returnHead:] {
+		MessagePoolReturn(chunk.payload)
+		if budget := self.returnMemoryBudget(); budget != nil {
+			budget.Release(chunk.charge)
+		}
+	}
+	self.returnChunks = nil
+	if self.returnMetadataByteCount != 0 {
+		self.returnMemoryBudget().Release(self.returnMetadataByteCount)
+		self.returnMetadataByteCount = 0
+	}
+	self.returnHead = 0
+	self.returnByteCount = 0
+}

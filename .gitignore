@@ -1,0 +1,4 @@
+out/
+deps/
+*.tar.gz
+*.tgz
