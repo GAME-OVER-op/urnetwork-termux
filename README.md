@@ -36,6 +36,10 @@ Outputs:
 
 No secrets are included in the build outputs. Credentials are supplied by the user at runtime.
 
+## Android provider with extender/port mapping
+
+`build-provider-android.sh` builds the provider for Android/arm64 with cgo (Bionic resolver) and the desktop extender role enabled, so `--no-port-mapping` can be omitted and the miner can ask the router for UPnP/NAT-PMP/PCP forwarding of TCP 443, UDP 443 and UDP 4053. Output: `provider-android-arm64`. It requires the Android NDK and clones the sibling `urnetwork` modules into `deps/`.
+
 ## Prebuilt VPS bundles
 
 Ready-to-install Linux binaries are published as GitHub release assets, so no Go toolchain is needed on the VPS:
